@@ -10683,14 +10683,17 @@ add_builtin(
     group="Geometry",
     doc="""Compute the closest point on the :class:`warp.Mesh` with identifier ``id`` to the given ``point`` in space.
 
-    The sign of the distance (inside/outside) is determined by casting ``n_sample`` rays from ``point``
-    and counting how many mesh faces each ray crosses. Sampling is deterministic: every call uses a
+    For a positive ``n_sample``, a point strictly outside the mesh's current bounding box is classified
+    as outside without casting rays. This assumes a watertight mesh and up-to-date bounds; call
+    :meth:`warp.Mesh.refit` after modifying vertex positions in place. Otherwise, the sign of the
+    distance (inside/outside) is determined by casting ``n_sample`` rays from ``point`` and counting
+    how many mesh faces each ray crosses. Sampling is deterministic: every call uses a
     fixed seed, so the same ``n_sample`` and ``perturbation_scale`` always produce the same ray
     directions. Each ray perturbs the base direction (1, 1, 1) by an offset drawn per axis from a
-    uniform distribution over [``-perturbation_scale``, ``perturbation_scale``), which avoids
+    uniform distribution over [``-perturbation_scale``, ``perturbation_scale``), which reduces the chance of
     degeneracies such as rays grazing shared edges or vertices.
 
-    The point is classified as inside when at least half of the rays cross an odd number of faces. With
+    When rays are cast, the point is classified as inside when at least half cross an odd number of faces. With
     an even ``n_sample`` an exact tie therefore counts as inside, so prefer a positive, odd ``n_sample``
     (larger values are more robust on imperfect meshes). A non-positive ``n_sample`` casts no rays and
     always classifies the point as inside. Sign classification examines the whole mesh and is not
@@ -10734,14 +10737,17 @@ add_builtin(
     group="Geometry",
     doc="""Compute the closest point on the :class:`warp.Mesh` with identifier ``id`` to the given ``point`` in space.
 
-    The sign of the distance (inside/outside) is determined by casting ``n_sample`` rays from ``point``
-    and counting how many mesh faces each ray crosses. Sampling is deterministic: every call uses a
+    For a positive ``n_sample``, a point strictly outside the mesh's current bounding box is classified
+    as outside without casting rays. This assumes a watertight mesh and up-to-date bounds; call
+    :meth:`warp.Mesh.refit` after modifying vertex positions in place. Otherwise, the sign of the
+    distance (inside/outside) is determined by casting ``n_sample`` rays from ``point`` and counting
+    how many mesh faces each ray crosses. Sampling is deterministic: every call uses a
     fixed seed, so the same ``n_sample`` and ``perturbation_scale`` always produce the same ray
     directions. Each ray perturbs the base direction (1, 1, 1) by an offset drawn per axis from a
-    uniform distribution over [``-perturbation_scale``, ``perturbation_scale``), which avoids
+    uniform distribution over [``-perturbation_scale``, ``perturbation_scale``), which reduces the chance of
     degeneracies such as rays grazing shared edges or vertices.
 
-    The point is classified as inside when at least half of the rays cross an odd number of faces. With
+    When rays are cast, the point is classified as inside when at least half cross an odd number of faces. With
     an even ``n_sample`` an exact tie therefore counts as inside, so prefer a positive, odd ``n_sample``
     (larger values are more robust on imperfect meshes). A non-positive ``n_sample`` casts no rays and
     always classifies the point as inside. Sign classification examines the whole mesh and is not
