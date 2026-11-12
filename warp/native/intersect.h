@@ -167,17 +167,44 @@ CUDA_CALLABLE inline bool intersect_ray_aabb_robust(
             if (pos[i] < lower[i] || pos[i] > upper[i])
                 return false;
         } else {
-            float l1 = (lower[i] - pos[i]) * rcp_dir[i];
-            float l2 = (upper[i] - pos[i]) * rcp_dir[i];
+            const float l1 = (lower[i] - pos[i]) * rcp_dir[i];
+            const float l2 = (upper[i] - pos[i]) * rcp_dir[i];
             lmin = max(min(l1, l2), lmin);
             lmax = min(max(l1, l2), lmax);
         }
     }
 
-    bool hit = ((lmax >= 0.f) & (lmax >= lmin));
-    if (hit)
+    const bool hit = ((lmax >= 0.0f) & (lmax >= lmin));
+    if (hit) {
         t = lmin;
-    return hit;
+        return true;
+    }
+
+    // A finite near-miss can be a rounding-induced reversal
+    // of two slab endpoints. Each endpoint has three float roundings (reciprocal,
+    // subtraction, product); 8u covers both endpoint errors with slack.
+    // Recompute only failed near intervals, from the original input coordinates.
+    // This is not conservative geometric padding and keeps axis-parallel checks.
+    const float uncertainty = 0x1p-21f * max(abs(lmin), abs(lmax));  // 8 * 2^-24
+    if (lmax >= 0.0f && lmin - lmax <= uncertainty) {
+        double near_t = -DBL_MAX;
+        double far_t = DBL_MAX;
+        for (int i = 0; i < 3; ++i) {
+            if (dir[i] != 0.0f) {
+                const double t1 = (double(lower[i]) - double(pos[i])) / double(dir[i]);
+                const double t2 = (double(upper[i]) - double(pos[i])) / double(dir[i]);
+                const double axis_near = t1 < t2 ? t1 : t2;
+                const double axis_far = t1 > t2 ? t1 : t2;
+                near_t = near_t > axis_near ? near_t : axis_near;
+                far_t = far_t < axis_far ? far_t : axis_far;
+            }
+        }
+        if (far_t >= 0.0 && far_t >= near_t) {
+            t = float(near_t);
+            return true;
+        }
+    }
+    return false;
 }
 
 CUDA_CALLABLE inline bool
@@ -341,6 +368,72 @@ CUDA_CALLABLE inline float diff_product(float a, float b, float c, float d)
 }
 
 // http://jcgt.org/published/0002/01/05/
+CUDA_CALLABLE inline double diff_product_double(double a, double b, double c, double d)
+{
+    const double cd = c * d;
+    const double diff = fma(a, b, -cd);
+    const double error = fma(-c, d, cd);
+    return diff + error;
+}
+
+CUDA_CALLABLE inline bool intersect_ray_tri_woop_double(
+    const vec3& p,
+    const vec3& dir,
+    const vec3& a,
+    const vec3& b,
+    const vec3& c,
+    float& t,
+    float& u,
+    float& v,
+    float& sign,
+    vec3* normal
+)
+{
+    // Recompute the complete ray transform from the original float inputs.
+    int kz = max_dim(dir);
+    int kx = (kz + 1) % 3;
+    int ky = (kx + 1) % 3;
+    if (dir[kz] < 0.0f) {
+        int tmp = kx;
+        kx = ky;
+        ky = tmp;
+    }
+    const double sx = double(dir[kx]) / double(dir[kz]);
+    const double sy = double(dir[ky]) / double(dir[kz]);
+    const double sz = 1.0 / double(dir[kz]);
+    const double az = double(a[kz]) - double(p[kz]);
+    const double bz = double(b[kz]) - double(p[kz]);
+    const double cz = double(c[kz]) - double(p[kz]);
+    const double ax = (double(a[kx]) - double(p[kx])) - sx * az;
+    const double ay = (double(a[ky]) - double(p[ky])) - sy * az;
+    const double bx = (double(b[kx]) - double(p[kx])) - sx * bz;
+    const double by = (double(b[ky]) - double(p[ky])) - sy * bz;
+    const double cx = (double(c[kx]) - double(p[kx])) - sx * cz;
+    const double cy = (double(c[ky]) - double(p[ky])) - sy * cz;
+    const double U = diff_product_double(cx, by, cy, bx);
+    const double V = diff_product_double(ax, cy, ay, cx);
+    const double W = diff_product_double(bx, ay, by, ax);
+    if ((U < 0.0 || V < 0.0 || W < 0.0) && (U > 0.0 || V > 0.0 || W > 0.0)) {
+        return false;
+    }
+    const double det = U + V + W;
+    if (det == 0.0) {
+        return false;
+    }
+    const double T = (U * az + V * bz + W * cz) * sz;
+    if ((det < 0.0 && T > 0.0) || (det > 0.0 && T < 0.0)) {
+        return false;
+    }
+    u = float(U / det);
+    v = float(V / det);
+    t = float(T / det);
+    sign = float(det);
+    if (normal) {
+        *normal = cross(b - a, c - a);
+    }
+    return true;
+}
+
 CUDA_CALLABLE inline bool intersect_ray_tri_woop(
     const vec3& p,
     const vec3& dir,
@@ -390,6 +483,18 @@ CUDA_CALLABLE inline bool intersect_ray_tri_woop(
     float U = diff_product(Cx, By, Cy, Bx);
     float V = diff_product(Ax, Cy, Ay, Cx);
     float W = diff_product(Bx, Ay, By, Ax);
+
+    // For finite normal-range inputs, repeat uncertain edge predicates using
+    // the original coordinates: promoting rounded projections loses the error.
+    // The bound covers float translation, shear and edge arithmetic with slack.
+    const float max_a = max(abs(A[0]), max(abs(A[1]), abs(A[2])));
+    const float max_b = max(abs(B[0]), max(abs(B[1]), abs(B[2])));
+    const float max_c = max(abs(C[0]), max(abs(C[1]), abs(C[2])));
+    const float magnitude = max(max_a, max(max_b, max_c));
+    const float edge_error = (128.0f * 5.9604644775390625e-8f * magnitude) * magnitude;
+    if (min(abs(U), min(abs(V), abs(W))) <= edge_error) {
+        return intersect_ray_tri_woop_double(p, dir, a, b, c, t, u, v, sign, normal);
+    }
 
     if (U == 0.0f || V == 0.0f || W == 0.0f) {
         double CxBy = (double)Cx * (double)By;

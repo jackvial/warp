@@ -842,6 +842,172 @@ def test_mesh_query_ray_parallel_slab_boundaries(test, device):
             test.assertEqual(anyhit_np[i], 1, f"[{constructor}] {label}: expected any-hit query to hit")
 
 
+@wp.func_native(
+    """
+    float t = 0.0f, u = 0.0f, v = 0.0f, sign = 0.0f;
+    wp::vec3 normal;
+    const bool hit = wp::intersect_ray_tri_woop(p, dir, a, b, c, t, u, v, sign, &normal);
+    return wp::vec4(hit ? 1.0f : 0.0f, t, u, v);
+    """
+)
+def ray_triangle_precision_native(p: wp.vec3, dir: wp.vec3, a: wp.vec3, b: wp.vec3, c: wp.vec3) -> wp.vec4: ...
+
+
+@wp.func_native(
+    """
+    const wp::vec3 reciprocal(1.0f / dir[0], 1.0f / dir[1], 1.0f / dir[2]);
+    float t = 0.0f;
+    const bool hit = wp::intersect_ray_aabb_robust(p, dir, reciprocal, lower, upper, t);
+    return wp::vec2(hit ? 1.0f : 0.0f, t);
+    """
+)
+def ray_aabb_precision_native(p: wp.vec3, dir: wp.vec3, lower: wp.vec3, upper: wp.vec3) -> wp.vec2: ...
+
+
+@wp.kernel(enable_backward=False)
+def ray_triangle_precision_kernel(
+    starts: wp.array[wp.vec3],
+    directions: wp.array[wp.vec3],
+    triangles: wp.array[wp.vec3],
+    results: wp.array[wp.vec4],
+):
+    i = wp.tid()
+    results[i] = ray_triangle_precision_native(
+        starts[i], directions[i], triangles[3 * i], triangles[3 * i + 1], triangles[3 * i + 2]
+    )
+
+
+@wp.kernel(enable_backward=False)
+def ray_aabb_precision_kernel(
+    starts: wp.array[wp.vec3],
+    directions: wp.array[wp.vec3],
+    lowers: wp.array[wp.vec3],
+    uppers: wp.array[wp.vec3],
+    results: wp.array[wp.vec2],
+):
+    i = wp.tid()
+    results[i] = ray_aabb_precision_native(starts[i], directions[i], lowers[i], uppers[i])
+
+
+def ray_precision_fixture():
+    # A four-vertex corner reduced from a mesh parity failure. Preserve the
+    # binary32 inputs: decimal truncation can move either ray across the edge.
+    vertices = np.array(
+        [
+            [1028452817, 1016565067, 1029745252],
+            [1025231591, 1016565067, 1031087430],
+            [1028452817, 1016565067, 1032429607],
+            [1028452817, 1012525108, 1032256466],
+        ],
+        dtype=np.uint32,
+    ).view(np.float32)
+    indices = np.array([[0, 1, 2], [3, 0, 2]], dtype=np.int32)
+    starts = np.array(
+        [[1019760744, 3154847705, 1023558907], [1019760742, 3154847711, 1023558899]], dtype=np.uint32
+    ).view(np.float32)
+    direction = np.array([1065602366, 1066078598, 1065644258], dtype=np.uint32).view(np.float32)
+    return vertices, indices, starts, direction
+
+
+def test_ray_triangle_projection_precision(test, device):
+    vertices, indices, starts, direction = ray_precision_fixture()
+    # Independent exact rational ray/triangle evaluation on the binary32 inputs
+    # gives strict interior hits on opposite sides of the shared edge. These
+    # weights are ordered by vertex, matching Warp's (u, v, 1-u-v) convention.
+    expected_weights = [
+        [0.784531136315415, 1.1823023727383375e-7, 0.21546874545434766],
+        [3.0821364573202275e-8, 0.7845331980605568, 0.21546677111807863],
+    ]
+    expected_t = [0.024844976479840332, 0.02484498147551714]
+    ray_starts, ray_dirs, triangles, expected = [], [], [], []
+    for ray_index, face_index, permutation in itertools.product(range(2), range(2), itertools.permutations(range(3))):
+        ray_starts.append(starts[ray_index])
+        ray_dirs.append(direction)
+        triangles.append(vertices[indices[face_index]][list(permutation)])
+        if ray_index == face_index:
+            weights = np.asarray(expected_weights[ray_index])[list(permutation)]
+            expected.append([1.0, expected_t[ray_index], weights[0], weights[1]])
+        else:
+            expected.append([0.0, 0.0, 0.0, 0.0])
+
+    # Ordinary perpendicular hit and miss keep the non-adaptive route covered.
+    for start, expected_row in [([0.25, 0.25, 1.0], [1.0, 1.0, 0.5, 0.25]), ([1.25, 0.25, 1.0], [0, 0, 0, 0])]:
+        ray_starts.append(start)
+        ray_dirs.append([0.0, 0.0, -1.0])
+        triangles.append([[0, 0, 0], [1, 0, 0], [0, 1, 0]])
+        expected.append(expected_row)
+
+    starts_np = np.asarray(ray_starts, dtype=np.float32)
+    dirs_np = np.asarray(ray_dirs, dtype=np.float32)
+    triangles_np = np.asarray(triangles, dtype=np.float32)
+    results = wp.empty(len(expected), dtype=wp.vec4, device=device)
+    wp.launch(
+        ray_triangle_precision_kernel,
+        dim=len(expected),
+        inputs=[
+            wp.array(starts_np, dtype=wp.vec3, device=device),
+            wp.array(dirs_np, dtype=wp.vec3, device=device),
+            wp.array(triangles_np.reshape(-1, 3), dtype=wp.vec3, device=device),
+        ],
+        outputs=[results],
+        device=device,
+    )
+    actual = results.numpy()
+    expected = np.asarray(expected, dtype=np.float64)
+    np.testing.assert_array_equal(actual[:, 0], expected[:, 0])
+    hits = expected[:, 0] == 1.0
+    np.testing.assert_allclose(actual[hits, 1:], expected[hits, 1:], rtol=2.0e-6, atol=2.0e-13)
+    weights = np.column_stack((actual[hits, 2:4], 1.0 - actual[hits, 2] - actual[hits, 3]))
+    triangle_hits = np.einsum("ij,ijk->ik", weights.astype(np.float64), triangles_np[hits].astype(np.float64))
+    ray_hits = starts_np[hits].astype(np.float64) + actual[hits, 1, None].astype(np.float64) * dirs_np[hits]
+    np.testing.assert_allclose(triangle_hits, ray_hits, rtol=0.0, atol=8.0e-9)
+
+
+def test_ray_aabb_interval_precision(test, device):
+    vertices, indices, starts, direction = ray_precision_fixture()
+    triangle = vertices[indices[1]]
+    # Ray 0 strictly misses the box; ray 1 intersects its zero-thickness x slab.
+    # Float arithmetic can reverse ray 1's interval by one ULP. Retrying that
+    # interval must not turn the neighboring strict miss into a geometric hit.
+    origins = [starts[0], starts[1], [0, 0, 2], [2, 0, 2]]
+    directions = [direction, direction, [0, 0, -1], [0, 0, -1]]
+    lowers = [triangle.min(axis=0), triangle.min(axis=0), [-1, -1, -1], [-1, -1, -1]]
+    uppers = [triangle.max(axis=0), triangle.max(axis=0), [1, 1, 1], [1, 1, 1]]
+    results = wp.empty(4, dtype=wp.vec2, device=device)
+    wp.launch(
+        ray_aabb_precision_kernel,
+        dim=4,
+        inputs=[wp.array(values, dtype=wp.vec3, device=device) for values in (origins, directions, lowers, uppers)],
+        outputs=[results],
+        device=device,
+    )
+    actual = results.numpy()
+    np.testing.assert_array_equal(actual[:, 0], [0.0, 1.0, 1.0, 0.0])
+    np.testing.assert_allclose(actual[[1, 2], 1], [0.02484498147551714, 1.0], rtol=1.0e-7, atol=0.0)
+
+
+def test_mesh_query_ray_count_near_corner(test, device):
+    vertices, indices, starts, direction = ray_precision_fixture()
+    points = wp.array(vertices, dtype=wp.vec3, device=device)
+    faces = wp.array(indices.reshape(-1), dtype=int, device=device)
+    origins = wp.array(starts, dtype=wp.vec3, device=device)
+    directions = wp.array(np.tile(direction, (2, 1)), dtype=wp.vec3, device=device)
+    counts = wp.empty(2, dtype=int, device=device)
+    constructors = ["sah", "median"] if device.is_cpu else ["sah", "median", "lbvh"]
+    for constructor, leaf_size in itertools.product(constructors, [1, 4]):
+        with test.subTest(constructor=constructor, leaf_size=leaf_size):
+            mesh = wp.Mesh(points=points, indices=faces, bvh_constructor=constructor, bvh_leaf_size=leaf_size)
+            wp.launch(
+                mesh_query_ray_count_intersections_kernel,
+                dim=2,
+                inputs=[mesh.id, origins, directions],
+                outputs=[counts],
+                device=device,
+            )
+            # Each ray intersects exactly one face, strictly inside that face.
+            np.testing.assert_array_equal(counts.numpy(), [1, 1])
+
+
 devices = get_test_devices()
 
 
@@ -862,6 +1028,15 @@ class TestMeshQueryRay(unittest.TestCase):
 
 
 add_function_test(TestMeshQueryRay, "test_mesh_query_ray_edge", test_mesh_query_ray_edge, devices=devices)
+add_function_test(
+    TestMeshQueryRay, "test_ray_triangle_projection_precision", test_ray_triangle_projection_precision, devices=devices
+)
+add_function_test(
+    TestMeshQueryRay, "test_ray_aabb_interval_precision", test_ray_aabb_interval_precision, devices=devices
+)
+add_function_test(
+    TestMeshQueryRay, "test_mesh_query_ray_count_near_corner", test_mesh_query_ray_count_near_corner, devices=devices
+)
 add_function_test(
     TestMeshQueryRay,
     "test_mesh_query_ray_parallel_slab_boundaries",
