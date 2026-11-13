@@ -1452,6 +1452,230 @@ def test_closest_point_triangle_boundary_grad(test, device):
     np.testing.assert_allclose(actual, expected, rtol=2e-4, atol=2e-4)
 
 
+def mesh_query_relative_distance_fixture():
+    vertices, faces, _ = closest_point_precision_fixture()
+    # Eight distinct native float32 inputs that still selected the bevel after
+    # fixing closest_point_to_triangle's Gram-determinant cancellation. All
+    # have a strictly closer interior projection on the neighboring flat face.
+    points = np.array(
+        [
+            [1017209282, 1011562211, 3142393395],
+            [1017209297, 1011562223, 3142393550],
+            [1017209293, 1011562212, 3142393547],
+            [1017209297, 1011562213, 3142393480],
+            [1017209301, 1011562213, 3142393693],
+            [1017209305, 1011562212, 3142393606],
+            [1017209313, 1011562210, 3142393678],
+            [1017209313, 1011562207, 3142393660],
+        ],
+        dtype=np.uint32,
+    ).view(np.float32)
+    return vertices, faces, points
+
+
+@wp.func
+def mesh_query_relative_mode(mesh: wp.uint64, point: wp.vec3, radius: float, mode: int):
+    if mode == 0:
+        return wp.mesh_query_point(mesh, point, radius)
+    elif mode == 1:
+        return wp.mesh_query_point_sign_parity(mesh, point, radius)
+    elif mode == 2:
+        return wp.mesh_query_point_sign_normal(mesh, point, radius)
+    elif mode == 3:
+        return wp.mesh_query_point_sign_winding_number(mesh, point, radius)
+    else:
+        return wp.mesh_query_point_no_sign(mesh, point, radius)
+
+
+@wp.kernel
+def mesh_query_relative_kernel(
+    mesh: wp.uint64,
+    points: wp.array[wp.vec3],
+    radii: wp.array[float],
+    results: wp.array2d[float],
+    closest: wp.array[wp.vec3],
+):
+    i = wp.tid()
+    query = mesh_query_relative_mode(mesh, points[i], radii[i], i % 5)
+    results[i, 0] = float(query.result)
+    if query.result:
+        results[i, 1] = float(query.face)
+        results[i, 2] = query.sign
+        results[i, 3] = query.u
+        results[i, 4] = query.v
+        closest[i] = wp.mesh_eval_position(mesh, query.face, query.u, query.v)
+
+
+def mesh_query_relative_results(mesh, points, radii):
+    points = np.repeat(np.asarray(points, np.float32), 5, axis=0)
+    radii = np.repeat(np.broadcast_to(np.asarray(radii, np.float32), (len(points) // 5,)), 5)
+    results = wp.zeros((len(points), 5), dtype=float, device=mesh.device)
+    closest = wp.zeros(len(points), dtype=wp.vec3, device=mesh.device)
+    wp.launch(
+        mesh_query_relative_kernel,
+        dim=len(points),
+        inputs=[
+            mesh.id,
+            wp.array(points, dtype=wp.vec3, device=mesh.device),
+            wp.array(radii, dtype=float, device=mesh.device),
+        ],
+        outputs=[results, closest],
+        device=mesh.device,
+    )
+    return results.numpy().reshape(-1, 5, 5), closest.numpy().reshape(-1, 5, 3)
+
+
+def test_mesh_query_relative_distance(test, device):
+    vertices, faces, points = mesh_query_relative_distance_fixture()
+    expected = points.copy()
+    expected[:, 1] = vertices[0, 1]
+    # Confirm strict finite-face uniqueness independently, rather than requiring
+    # a particular face for genuinely tied queries.
+    for point, reference in zip(points, expected, strict=True):
+        flat = closest_point_triangle_reference(vertices[faces[1]], point)
+        bevel = closest_point_triangle_reference(vertices[faces[0]], point)
+        np.testing.assert_allclose(flat, reference, rtol=0, atol=1e-16)
+        test.assertLess(np.linalg.norm(flat - point), np.linalg.norm(bevel - point))
+    for order, permutation, axes, expanded in itertools.product(
+        ((0, 1), (1, 0)), itertools.permutations(range(3)), ((0, 1, 2), (2, 0, 1)), (False, True)
+    ):
+        with test.subTest(order=order, permutation=permutation, axes=axes, expanded=expanded):
+            v = vertices[:, axes].copy()
+            f = faces[list(order)][:, permutation].copy()
+            if expanded:
+                # Force traversal beyond the two-face leaf without changing the
+                # nearest surface. These distant triangles are all nondegenerate.
+                for i in range(8):
+                    f = np.vstack((f, np.arange(len(v), len(v) + 3)))
+                    v = np.vstack((v, vertices[faces[0]][:, axes] + np.array([0.1 + 0.01 * i, 0.1, 0.1])))
+            mesh = wp.Mesh(
+                points=wp.array(v, dtype=wp.vec3, device=device),
+                indices=wp.array(f.ravel(), dtype=int, device=device),
+                support_winding_number=True,
+                bvh_leaf_size=1,
+            )
+            result, closest = mesh_query_relative_results(mesh, points[:, axes], 4e-6)
+            np.testing.assert_array_equal(result[:, :, 0], 1.0)
+            np.testing.assert_array_equal(result[:, :, 1], order.index(1))
+            # mesh_eval_position remains an absolute-coordinate reconstruction;
+            # its output accuracy is distinct from the internal distance ranking.
+            np.testing.assert_allclose(closest, np.repeat(expected[:, None, axes], 5, axis=1), rtol=0, atol=8e-9)
+            weights = np.concatenate((result[:, :, 3:5], (1.0 - result[:, :, 3:4] - result[:, :, 4:5])), axis=2)
+            test.assertGreaterEqual(float(weights.min()), -2 * np.finfo(np.float32).eps)
+            # The fixture is open and vertex permutations may reverse winding;
+            # no solid-containment claim is made from its sign results.
+
+
+def test_mesh_query_relative_radius_and_sign(test, device):
+    vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float32)
+    faces = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]], dtype=np.int32)
+    mesh = wp.Mesh(
+        points=wp.array(vertices, dtype=wp.vec3, device=device),
+        indices=wp.array(faces.ravel(), dtype=int, device=device),
+        support_winding_number=True,
+        bvh_leaf_size=1,
+    )
+    points = np.array([[0.25, 0.25, -0.125], [0.25, 0.25, 0.125]], np.float32)
+    radius = np.float32(0.125)
+    for r, found in (
+        (np.nextafter(radius, np.float32(0)), False),
+        (radius, False),
+        (np.nextafter(radius, np.float32(np.inf)), True),
+    ):
+        result, closest = mesh_query_relative_results(mesh, points, r)
+        np.testing.assert_array_equal(result[:, :, 0], float(found))
+        if found:
+            np.testing.assert_array_equal(result[:, :, 1], 0)
+            np.testing.assert_array_equal(result[:, :4, 2], np.tile([[1.0], [-1.0]], (1, 4)))
+            np.testing.assert_array_equal(closest, np.tile([0.25, 0.25, 0.0], (2, 5, 1)))
+    # Exact vertex projections exercise finite-segment endpoints t=0 and t=1.
+    # Cyclic permutations preserve the closed surface's outward winding. Any
+    # incident tied face is valid; only the geometric result and sign are fixed.
+    points = np.array([[0, 0, -0.25], [1, 0, -0.25], [0, 1, -0.25]], np.float32)
+    expected = vertices[:3]
+    incident = ({0, 1, 2}, {0, 1, 3}, {0, 2, 3})
+    radius = np.float32(0.25)
+    for permutation in ((0, 1, 2), (1, 2, 0), (2, 0, 1)):
+        mesh = wp.Mesh(
+            points=wp.array(vertices, dtype=wp.vec3, device=device),
+            indices=wp.array(faces[:, permutation].ravel(), dtype=int, device=device),
+            support_winding_number=True,
+            bvh_leaf_size=1,
+        )
+        for r, found in (
+            (np.nextafter(radius, np.float32(0)), False),
+            (radius, False),
+            (np.nextafter(radius, np.float32(np.inf)), True),
+        ):
+            result, closest = mesh_query_relative_results(mesh, points, r)
+            np.testing.assert_array_equal(result[:, :, 0], float(found))
+            if found:
+                for row, valid_faces in enumerate(incident):
+                    test.assertTrue(set(result[row, :, 1]).issubset(valid_faces))
+                np.testing.assert_array_equal(result[:, :4, 2], 1.0)
+                np.testing.assert_array_equal(closest, np.repeat(expected[:, None, :], 5, axis=1))
+    # Tight, finite search radii around the historical queries have explicit
+    # geometric headroom; do not conflate their nonbinary distances with the
+    # exact one-ULP boundary control above.
+    vertices, faces, points = mesh_query_relative_distance_fixture()
+    mesh = wp.Mesh(
+        points=wp.array(vertices, dtype=wp.vec3, device=device),
+        indices=wp.array(faces.ravel(), dtype=int, device=device),
+        support_winding_number=True,
+    )
+    distance = points[:, 1] - vertices[0, 1]
+    for offset, found in ((-4e-9, False), (4e-9, True)):
+        result, _ = mesh_query_relative_results(mesh, points, distance + offset)
+        np.testing.assert_array_equal(result[:, :, 0], float(found))
+        if found:
+            np.testing.assert_array_equal(result[:, :, 1], 1)
+
+
+def test_mesh_query_relative_tie(test, device):
+    # The exact orthogonal projection is on a shared edge. Either face is a
+    # valid answer; face order must not be mistaken for a geometric failure.
+    vertices = np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]], np.float32)
+    faces = np.array([[0, 1, 2], [0, 2, 3]], np.int32)
+    for order in ((0, 1), (1, 0)):
+        mesh = wp.Mesh(
+            points=wp.array(vertices, dtype=wp.vec3, device=device),
+            indices=wp.array(faces[list(order)].ravel(), dtype=int, device=device),
+            support_winding_number=True,
+        )
+        result, closest = mesh_query_relative_results(mesh, [[0.5, 0.5, 0.125]], 0.25)
+        np.testing.assert_array_equal(result[:, :, 0], 1.0)
+        test.assertTrue(np.isin(result[:, :, 1], [0, 1]).all())
+        np.testing.assert_array_equal(closest, np.tile([0.5, 0.5, 0], (1, 5, 1)))
+
+
+def test_mesh_query_relative_grad(test, device):
+    vertices, faces, points = mesh_query_relative_distance_fixture()
+    mesh = wp.Mesh(
+        points=wp.array(vertices, dtype=wp.vec3, device=device),
+        indices=wp.array(faces.ravel(), dtype=int, device=device),
+        support_winding_number=True,
+    )
+    points = np.repeat(points, 5, axis=0)
+    point_wp = wp.array(points, dtype=wp.vec3, device=device, requires_grad=True)
+    radii = wp.full(len(points), 4e-6, dtype=float, device=device, requires_grad=True)
+    results = wp.zeros((len(points), 5), dtype=float, device=device)
+    closest = wp.zeros(len(points), dtype=wp.vec3, device=device, requires_grad=True)
+    with wp.Tape() as tape:
+        wp.launch(
+            mesh_query_relative_kernel,
+            dim=len(points),
+            inputs=[mesh.id, point_wp, radii],
+            outputs=[results, closest],
+            device=device,
+        )
+    tape.backward(grads={closest: wp.array(np.tile([0.3, -0.2, 0.7], (len(points), 1)), dtype=wp.vec3, device=device)})
+    np.testing.assert_array_equal(results.numpy()[:, 1], 1)
+    # The selected flat is smooth at each point. Its projection derivative is
+    # diag(1,0,1); face selection and the query radius are not differentiated.
+    np.testing.assert_allclose(point_wp.grad.numpy(), np.tile([0.3, 0.0, 0.7], (len(points), 1)), rtol=2e-4, atol=2e-4)
+    np.testing.assert_array_equal(radii.grad.numpy(), 0.0)
+
+
 devices = get_test_devices()
 
 
@@ -1515,6 +1739,18 @@ add_function_test(
     test_closest_point_triangle_boundary_grad,
     devices=devices,
 )
+
+add_function_test(
+    TestMeshQueryPoint, "test_mesh_query_relative_distance", test_mesh_query_relative_distance, devices=devices
+)
+add_function_test(
+    TestMeshQueryPoint,
+    "test_mesh_query_relative_radius_and_sign",
+    test_mesh_query_relative_radius_and_sign,
+    devices=devices,
+)
+add_function_test(TestMeshQueryPoint, "test_mesh_query_relative_tie", test_mesh_query_relative_tie, devices=devices)
+add_function_test(TestMeshQueryPoint, "test_mesh_query_relative_grad", test_mesh_query_relative_grad, devices=devices)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

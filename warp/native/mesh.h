@@ -122,6 +122,32 @@ CUDA_CALLABLE inline float mesh_query_inside_ray_tracing(uint64_t id, const vec3
 CUDA_CALLABLE inline float
 mesh_query_inside_parity(uint64_t id, const vec3& p, const vec3 base_dir, int n_sample, float perturbation_scale);
 
+// Evaluate a finite segment relative to the query, using the nearer endpoint
+// as the anchor to retain accuracy near either vertex.
+CUDA_CALLABLE inline vec3 mesh_query_segment_point_delta(const vec3& a, const vec3& b, const vec3& point, float t)
+{
+    if (t <= 0.5f)
+        return (a - point) + t * (b - a);
+    return (b - point) + (1.0f - t) * (a - b);
+}
+
+CUDA_CALLABLE inline vec3 mesh_query_triangle_point_delta(
+    const vec3& p, const vec3& q, const vec3& r, const vec3& point, float u, float v, float w
+)
+{
+    // A complementary weight can round slightly negative on an edge. Use its
+    // finite segment parameter instead of extrapolating beyond the triangle.
+    if (u <= 0.0f)
+        return mesh_query_segment_point_delta(r, q, point, v);
+    if (v <= 0.0f)
+        return mesh_query_segment_point_delta(r, p, point, u);
+    if (w <= 0.0f)
+        return mesh_query_segment_point_delta(p, q, point, v);
+
+    // Do not round an absolute closest point before subtracting the query.
+    return (p - point) + v * (q - p) + w * (r - p);
+}
+
 // returns true if there is a point (strictly) < distance max_dist
 CUDA_CALLABLE inline bool
 mesh_query_point(uint64_t id, const vec3& point, float max_dist, float& inside, int& face, float& u, float& v)
@@ -181,9 +207,8 @@ mesh_query_point(uint64_t id, const vec3& point, float max_dist, float& inside, 
                 float u = barycentric[0];
                 float v = barycentric[1];
                 float w = 1.f - u - v;
-                vec3 c = u * p + v * q + w * r;
-
-                float dist_sq = length_sq(c - point);
+                vec3 delta = mesh_query_triangle_point_delta(p, q, r, point, u, v, w);
+                float dist_sq = length_sq(delta);
 
                 if (dist_sq < min_dist_sq) {
                     min_dist_sq = dist_sq;
@@ -308,9 +333,8 @@ CUDA_CALLABLE inline bool mesh_query_point_sign_parity(
                 float u = barycentric[0];
                 float v = barycentric[1];
                 float w = 1.f - u - v;
-                vec3 c = u * p + v * q + w * r;
-
-                float dist_sq = length_sq(c - point);
+                vec3 delta = mesh_query_triangle_point_delta(p, q, r, point, u, v, w);
+                float dist_sq = length_sq(delta);
 
                 if (dist_sq < min_dist_sq) {
                     min_dist_sq = dist_sq;
@@ -425,9 +449,8 @@ mesh_query_point_no_sign(uint64_t id, const vec3& point, float max_dist, int& fa
                 float u = barycentric[0];
                 float v = barycentric[1];
                 float w = 1.f - u - v;
-                vec3 c = u * p + v * q + w * r;
-
-                float dist_sq = length_sq(c - point);
+                vec3 delta = mesh_query_triangle_point_delta(p, q, r, point, u, v, w);
+                float dist_sq = length_sq(delta);
 
                 if (dist_sq < min_dist_sq) {
                     min_dist_sq = dist_sq;
@@ -670,7 +693,8 @@ CUDA_CALLABLE inline bool mesh_query_point_sign_normal(
                 float v = barycentric[1];
                 float w = 1.f - u - v;
                 vec3 c = u * p + v * q + w * r;
-                float dist = sqrtf(length_sq(c - point));
+                vec3 delta = mesh_query_triangle_point_delta(p, q, r, point, u, v, w);
+                float dist = sqrtf(length_sq(delta));
                 if (dist < min_dist + epsilon_min_dist) {
                     float weight = 0.0f;
                     vec3 cp = c - p;
@@ -927,9 +951,8 @@ CUDA_CALLABLE inline bool mesh_query_point_sign_winding_number(
                 float u = barycentric[0];
                 float v = barycentric[1];
                 float w = 1.f - u - v;
-                vec3 c = u * p + v * q + w * r;
-
-                float dist_sq = length_sq(c - point);
+                vec3 delta = mesh_query_triangle_point_delta(p, q, r, point, u, v, w);
+                float dist_sq = length_sq(delta);
 
                 if (dist_sq < min_dist_sq) {
                     min_dist_sq = dist_sq;
