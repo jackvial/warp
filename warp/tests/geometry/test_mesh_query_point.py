@@ -1109,6 +1109,349 @@ def test_mesh_query_parity_bounds_refit(test, device):
             check_sign(mesh, 1)
 
 
+# A pair of adjacent faces reduced from a close-clearance mesh query. Keeping
+# the original binary32 coordinates makes this independent of any CAD asset.
+def closest_point_precision_fixture():
+    vertices = np.array(
+        [
+            [0.0197, 0.0124, -0.0144],
+            [0.0197, 0.0124, 0.0144],
+            [0.0227, 0.0094, -0.0144],
+            [0.0191, 0.0124, -0.0144],
+        ],
+        dtype=np.float32,
+    )
+    points = np.array(
+        [
+            [0.019699811935424805, 0.012403983622789383, 0.003116013016551733],
+            [0.019699353724718094, 0.012403230182826519, -0.0031294734217226505],
+        ],
+        dtype=np.float32,
+    )
+    return vertices, np.array([[0, 1, 2], [1, 0, 3]], dtype=np.int32), points
+
+
+def closest_point_boundary_fixture():
+    # Refining the face projection must not return coordinates outside the
+    # triangle. These two points project onto AC and BC respectively.
+    data = np.array(
+        [
+            [
+                [1109193749, 1109307421, 3254786347],
+                [3289244216, 1144799206, 1134515891],
+                [3284410732, 1141405764, 1129860094],
+                [3274738941, 1133665002, 1119381205],
+            ],
+            [
+                [3106103682, 3110716876, 3141419707],
+                [3169175261, 999262576, 1005180076],
+                [3164833088, 994544879, 998922122],
+                [3167004306, 997400312, 1002052511],
+            ],
+        ],
+        dtype=np.uint32,
+    ).view(np.float32)
+    return data[:, :3], data[:, 3]
+
+
+def closest_point_triangle_reference(triangle, point):
+    """Independent float64 finite-triangle projection, including all edges."""
+    a, b, c = np.asarray(triangle, dtype=np.float64)
+    p = np.asarray(point, dtype=np.float64)
+    candidates = []
+    for start, end in ((a, b), (b, c), (c, a)):
+        edge = end - start
+        length_sq = np.dot(edge, edge)
+        t = np.clip(np.dot(p - start, edge) / length_sq, 0.0, 1.0) if length_sq else 0.0
+        candidates.append(start + t * edge)
+    normal = np.cross(b - a, c - a)
+    normal_sq = np.dot(normal, normal)
+    if normal_sq:
+        projection = p - normal * (np.dot(p - a, normal) / normal_sq)
+        if all(
+            np.dot(np.cross(end - start, projection - start), normal) >= 0 for start, end in ((a, b), (b, c), (c, a))
+        ):
+            candidates.append(projection)
+    return min(candidates, key=lambda q: np.dot(p - q, p - q))
+
+
+@wp.func_native(
+    "return wp::closest_point_to_triangle(a, b, c, p);",
+    adj_snippet="wp::adj_closest_point_to_triangle(a, b, c, p, adj_a, adj_b, adj_c, adj_p, adj_ret);",
+)
+def closest_point_precision_native(a: wp.vec3, b: wp.vec3, c: wp.vec3, p: wp.vec3) -> wp.vec2: ...
+
+
+@wp.kernel
+def closest_point_precision_kernel(
+    triangles: wp.array[wp.vec3],
+    points: wp.array[wp.vec3],
+    closest: wp.array[wp.vec3],
+    barycentric: wp.array[wp.vec2],
+):
+    i = wp.tid()
+    a = triangles[3 * i]
+    b = triangles[3 * i + 1]
+    c = triangles[3 * i + 2]
+    uv = closest_point_precision_native(a, b, c, points[i])
+    closest[i] = uv[0] * a + uv[1] * b + (1.0 - uv[0] - uv[1]) * c
+    barycentric[i] = uv
+
+
+@wp.kernel(enable_backward=False)
+def closest_point_precision_mesh_kernel(
+    mesh: wp.uint64,
+    points: wp.array[wp.vec3],
+    closest: wp.array[wp.vec3],
+    faces: wp.array[int],
+):
+    i = wp.tid()
+    query = wp.mesh_query_point_no_sign(mesh, points[i], 1.0)
+    parity = wp.mesh_query_point_sign_parity(mesh, points[i], 1.0)
+    wp.expect_eq(query.result, True)
+    wp.expect_eq(parity.result, True)
+    wp.expect_eq(query.face, parity.face)
+    wp.expect_eq(query.u, parity.u)
+    wp.expect_eq(query.v, parity.v)
+    closest[i] = wp.mesh_eval_position(mesh, query.face, query.u, query.v)
+    faces[i] = query.face
+
+
+def test_closest_point_triangle_precision(test, device):
+    vertices, indices, points = closest_point_precision_fixture()
+    triangle = vertices[indices[1]]
+    rng = np.random.default_rng(14892)
+    nearby = np.column_stack(
+        (
+            triangle[0, 0] + rng.uniform(-2e-6, 2e-6, 32),
+            triangle[0, 1] + rng.uniform(0.5e-6, 8e-6, 32),
+            rng.uniform(-0.01, 0.01, 32),
+        )
+    ).astype(np.float32)
+    points = np.concatenate((points, nearby))
+    angle = 0.37
+    rotation = np.array([[np.cos(angle), -np.sin(angle), 0], [np.sin(angle), np.cos(angle), 0], [0, 0, 1]])
+    frames = (
+        (np.eye(3), np.zeros(3)),
+        (np.array([[0, 0, 1], [1, 0, 0], [0, 1, 0]]), np.array([0.00390625, -0.0078125, 0.015625])),
+        (rotation, np.array([-0.0078125, 0.00390625, 0])),
+    )
+    triangles, queries = [], []
+    for permutation, (rotation, translation) in itertools.product(itertools.permutations(range(3)), frames):
+        tri = (triangle[list(permutation)].astype(np.float64) @ rotation.T + translation).astype(np.float32)
+        q = (points.astype(np.float64) @ rotation.T + translation).astype(np.float32)
+        triangles.extend([tri] * len(q))
+        queries.extend(q)
+    # Exercise every ordinary vertex and edge region as well as the face.
+    regular = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=np.float32)
+    ordinary = [
+        [-0.2, -0.1, 0.3],
+        [1.2, -0.1, 0.3],
+        [-0.1, 1.2, 0.3],
+        [0.3, -0.1, 0.3],
+        [-0.1, 0.3, 0.3],
+        [0.7, 0.7, 0.3],
+        [0.2, 0.3, 0.3],
+    ]
+    triangles.extend([regular] * len(ordinary))
+    queries.extend(ordinary)
+    # Preserve defined coincident/collinear cases without introducing a new
+    # contract for arbitrary degenerate meshes or differentiating boundaries.
+    triangles.extend([[[0.1, 0.2, 0.3]] * 3, [[0, 0, 0], [1, 0, 0], [2, 0, 0]], [[0, 0, 0], [1, 0, 0], [2, 0, 0]]])
+    queries.extend([[0.3, 0.3, 0.1], [0.5, 0.2, 0], [1.5, 0.2, 0]])
+    # Rotated skinny faces must also satisfy the face projection equations.
+    # These bit-exact cases cover aspect ratios 1e-3, 1e-4 and 1e-5.
+    skinny = np.array(
+        [
+            [
+                [3182349133, 1025857097, 3171818777],
+                [3207811024, 1057218383, 1058555146],
+                [3204808973, 1052842367, 1054046086],
+                [3197850419, 1045813758, 1044492726],
+            ],
+            [
+                [942711382, 3090412363, 948933577],
+                [3121259607, 962874410, 3124371722],
+                [3116264975, 957678763, 3120426302],
+                [3119112246, 960270185, 3122433062],
+            ],
+            [
+                [1017209618, 1036078285, 3182284678],
+                [3208203339, 3184204214, 1057891044],
+                [3204585784, 3174061091, 1052588896],
+                [3199481345, 3139168957, 1047585051],
+            ],
+        ],
+        dtype=np.uint32,
+    ).view(np.float32)
+    triangles.extend(skinny[:, :3])
+    queries.extend(skinny[:, 3])
+    boundary_triangles, boundary_points = closest_point_boundary_fixture()
+    triangles.extend(boundary_triangles)
+    queries.extend(boundary_points)
+    triangles, queries = np.asarray(triangles, np.float32), np.asarray(queries, np.float32)
+    expected = np.array([closest_point_triangle_reference(t, p) for t, p in zip(triangles, queries, strict=True)])
+    closest = wp.empty(len(queries), dtype=wp.vec3, device=device)
+    barycentric = wp.empty(len(queries), dtype=wp.vec2, device=device)
+    wp.launch(
+        closest_point_precision_kernel,
+        dim=len(queries),
+        inputs=[
+            wp.array(triangles.reshape(-1, 3), dtype=wp.vec3, device=device),
+            wp.array(queries, dtype=wp.vec3, device=device),
+        ],
+        outputs=[closest, barycentric],
+        device=device,
+    )
+    result = closest.numpy().astype(np.float64)
+    # Allow the final binary32 barycentric reconstruction, not the much larger
+    # cancellation error in the region determinants (up to 0.68 micrometres).
+    budgets = 8 * np.finfo(np.float32).eps * np.max(np.abs(triangles), axis=(1, 2))
+    errors = np.linalg.norm(result - expected, axis=1)
+    test.assertTrue(np.all(errors <= budgets), f"maximum reconstruction error/budget: {np.max(errors / budgets)}")
+    uv = barycentric.numpy()
+    test.assertTrue(np.isfinite(uv).all())
+    test.assertTrue(np.all(uv >= -2e-7))
+    test.assertTrue(np.all(uv.sum(axis=1) <= 1.0 + 2e-7))
+
+
+def test_mesh_query_point_close_faces(test, device):
+    vertices, indices, points = closest_point_precision_fixture()
+    expected = points.astype(np.float64)
+    expected[:, 1] = float(vertices[0, 1])
+    # The correct face is strictly closer for both points, and its projections
+    # are interior. Reordering either face must not change that answer.
+    for order, permutation in itertools.product(([0, 1], [1, 0]), itertools.permutations(range(3))):
+        faces = indices[list(order)][:, list(permutation)]
+        with test.subTest(order=order, permutation=permutation):
+            mesh = wp.Mesh(
+                points=wp.array(vertices, dtype=wp.vec3, device=device),
+                indices=wp.array(faces.ravel(), dtype=int, device=device),
+            )
+            closest = wp.empty(len(points), dtype=wp.vec3, device=device)
+            found_faces = wp.empty(len(points), dtype=int, device=device)
+            wp.launch(
+                closest_point_precision_mesh_kernel,
+                dim=len(points),
+                inputs=[mesh.id, wp.array(points, dtype=wp.vec3, device=device)],
+                outputs=[closest, found_faces],
+                device=device,
+            )
+            np.testing.assert_array_equal(found_faces.numpy(), np.full(len(points), order.index(1)))
+            result = closest.numpy().astype(np.float64)
+            np.testing.assert_allclose(result, expected, rtol=0, atol=8e-9)
+            directions = points.astype(np.float64) - result
+            directions /= np.linalg.norm(directions, axis=1)[:, None]
+            np.testing.assert_allclose(directions, np.tile([0.0, 1.0, 0.0], (len(points), 1)), rtol=0, atol=2e-3)
+
+
+def test_closest_point_triangle_precision_grad(test, device):
+    vertices, indices, points = closest_point_precision_fixture()
+    thin = vertices[indices[1]]
+    regular = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=np.float32)
+    queries = np.concatenate(
+        (
+            points,
+            np.array(
+                [
+                    [0.2, 0.3, 0.4],
+                    [0.3, -0.2, 0.4],
+                    [-0.2, 0.3, 0.4],
+                    [0.7, 0.7, 0.4],
+                    [-0.2, -0.1, 0.4],
+                    [1.2, -0.1, 0.4],
+                    [-0.1, 1.2, 0.4],
+                ],
+                np.float32,
+            ),
+        )
+    )
+    triangles = np.array([thin, thin] + [regular] * 7, dtype=np.float32)
+    weights = np.array([0.3, -0.2, 0.7], dtype=np.float32)
+    tri_wp = wp.array(triangles.reshape(-1, 3), dtype=wp.vec3, device=device, requires_grad=True)
+    point_wp = wp.array(queries, dtype=wp.vec3, device=device, requires_grad=True)
+    closest = wp.empty(len(queries), dtype=wp.vec3, device=device, requires_grad=True)
+    barycentric = wp.empty(len(queries), dtype=wp.vec2, device=device)
+    with wp.Tape() as tape:
+        wp.launch(
+            closest_point_precision_kernel,
+            dim=len(queries),
+            inputs=[tri_wp, point_wp],
+            outputs=[closest, barycentric],
+            device=device,
+        )
+    tape.backward(grads={closest: wp.array(np.tile(weights, (len(queries), 1)), dtype=wp.vec3, device=device)})
+    expected = np.empty((len(queries), 4, 3))
+    for i, (triangle, point) in enumerate(zip(triangles, queries, strict=True)):
+        # These points stay in one smooth feature region for the entire stencil.
+        variables = np.vstack((triangle, point)).astype(np.float64)
+        epsilon = 1e-8 if i < 2 else 1e-5
+        for row, coordinate in itertools.product(range(4), range(3)):
+            plus, minus = variables.copy(), variables.copy()
+            plus[row, coordinate] += epsilon
+            minus[row, coordinate] -= epsilon
+            p = closest_point_triangle_reference(plus[:3], plus[3])
+            m = closest_point_triangle_reference(minus[:3], minus[3])
+            expected[i, row, coordinate] = np.dot(weights, p - m) / (2 * epsilon)
+    actual = np.concatenate((tri_wp.grad.numpy().reshape(-1, 3, 3), point_wp.grad.numpy()[:, None, :]), axis=1)
+    np.testing.assert_allclose(actual, expected, rtol=2e-4, atol=2e-4)
+
+
+def test_closest_point_triangle_boundary_grad(test, device):
+    triangles, points = closest_point_boundary_fixture()
+    # The original inputs are too near a feature boundary for an ordinary
+    # finite-difference stencil. Use the analytic finite-edge derivative and
+    # also check controls farther outside the same two edges.
+    edge_ids = [(0, 2), (1, 2)]
+    controls = []
+    for triangle, point, (i, j) in zip(triangles, points, edge_ids, strict=True):
+        tri = triangle.astype(np.float64)
+        p = point.astype(np.float64)
+        a, b = tri[i], tri[j]
+        edge = b - a
+        normal = np.cross(tri[1] - tri[0], tri[2] - tri[0])
+        normal /= np.linalg.norm(normal)
+        projected = a + np.dot(p - a, edge) / np.dot(edge, edge) * edge
+        outward = p - projected - np.dot(p - projected, normal) * normal
+        outward /= np.linalg.norm(outward)
+        controls.append(p + 1e-4 * np.linalg.norm(edge) * outward)
+    triangles = np.concatenate((triangles, triangles))
+    points = np.concatenate((points, np.asarray(controls, np.float32)))
+    edge_ids *= 2
+    weights = np.array([0.3, -0.2, 0.7], dtype=np.float32)
+    tri_wp = wp.array(triangles.reshape(-1, 3), dtype=wp.vec3, device=device, requires_grad=True)
+    point_wp = wp.array(points, dtype=wp.vec3, device=device, requires_grad=True)
+    closest = wp.empty(len(points), dtype=wp.vec3, device=device, requires_grad=True)
+    barycentric = wp.empty(len(points), dtype=wp.vec2, device=device)
+    with wp.Tape() as tape:
+        wp.launch(
+            closest_point_precision_kernel,
+            dim=len(points),
+            inputs=[tri_wp, point_wp],
+            outputs=[closest, barycentric],
+            device=device,
+        )
+    tape.backward(grads={closest: wp.array(np.tile(weights, (len(points), 1)), dtype=wp.vec3, device=device)})
+    expected = np.zeros((len(points), 4, 3))
+    reference_weights = weights.astype(np.float64)
+    for row, (triangle, point, (i, j)) in enumerate(zip(triangles, points, edge_ids, strict=True)):
+        a, b = triangle.astype(np.float64)[[i, j]]
+        edge = b - a
+        offset = point.astype(np.float64) - a
+        length_sq = np.dot(edge, edge)
+        t = np.dot(offset, edge) / length_sq
+        test.assertGreater(t, 0.0)
+        test.assertLess(t, 1.0)
+        along = np.dot(reference_weights, edge)
+        expected[row, i] = (1.0 - t) * reference_weights + along * ((2.0 * t - 1.0) * edge - offset) / length_sq
+        expected[row, j] = t * reference_weights + along * (offset - 2.0 * t * edge) / length_sq
+        expected[row, 3] = along * edge / length_sq
+        # The opposite vertex has no derivative in this smooth edge region.
+        np.testing.assert_allclose(expected[row].sum(axis=0), weights, rtol=0, atol=1e-12)
+    actual = np.concatenate((tri_wp.grad.numpy().reshape(-1, 3, 3), point_wp.grad.numpy()[:, None, :]), axis=1)
+    np.testing.assert_allclose(actual, expected, rtol=2e-4, atol=2e-4)
+
+
 devices = get_test_devices()
 
 
@@ -1151,6 +1494,26 @@ add_function_test(
 )
 add_function_test(
     TestMeshQueryPoint, "test_mesh_query_parity_bounds_refit", test_mesh_query_parity_bounds_refit, devices=devices
+)
+
+add_function_test(
+    TestMeshQueryPoint, "test_closest_point_triangle_precision", test_closest_point_triangle_precision, devices=devices
+)
+add_function_test(
+    TestMeshQueryPoint, "test_mesh_query_point_close_faces", test_mesh_query_point_close_faces, devices=devices
+)
+add_function_test(
+    TestMeshQueryPoint,
+    "test_closest_point_triangle_precision_grad",
+    test_closest_point_triangle_precision_grad,
+    devices=devices,
+)
+
+add_function_test(
+    TestMeshQueryPoint,
+    "test_closest_point_triangle_boundary_grad",
+    test_closest_point_triangle_boundary_grad,
+    devices=devices,
 )
 
 if __name__ == "__main__":

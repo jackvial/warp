@@ -41,6 +41,36 @@ CUDA_CALLABLE inline vec3 closest_point_to_aabb(const vec3& p, const vec3& lower
     return c;
 }
 
+struct TriangleEdgeProjection {
+    int edge;
+    float parameter;
+};
+
+CUDA_CALLABLE inline TriangleEdgeProjection
+closest_point_to_triangle_boundary(const vec3& a, const vec3& b, const vec3& c, const vec3& p)
+{
+    const vec3 ab = b - a;
+    const vec3 ac = c - a;
+    const vec3 bc = c - b;
+    const float ab_sq = dot(ab, ab);
+    const float ac_sq = dot(ac, ac);
+    const float bc_sq = dot(bc, bc);
+    const float tab = ab_sq > 0.0f ? clamp(dot(p - a, ab) / ab_sq, 0.0f, 1.0f) : 0.0f;
+    const float tac = ac_sq > 0.0f ? clamp(dot(p - a, ac) / ac_sq, 0.0f, 1.0f) : 0.0f;
+    const float tbc = bc_sq > 0.0f ? clamp(dot(p - b, bc) / bc_sq, 0.0f, 1.0f) : 0.0f;
+    float distance_sq = length_sq(p - (a + tab * ab));
+    TriangleEdgeProjection result = { 0, tab };
+    const float ac_distance_sq = length_sq(p - (a + tac * ac));
+    if (ac_distance_sq < distance_sq) {
+        result = { 1, tac };
+        distance_sq = ac_distance_sq;
+    }
+    if (length_sq(p - (b + tbc * bc)) < distance_sq) {
+        result = { 2, tbc };
+    }
+    return result;
+}
+
 CUDA_CALLABLE inline vec2 closest_point_to_triangle(const vec3& a, const vec3& b, const vec3& c, const vec3& p)
 {
     vec3 ab = b - a;
@@ -67,7 +97,11 @@ CUDA_CALLABLE inline vec2 closest_point_to_triangle(const vec3& a, const vec3& b
         return vec2(u, v);
     }
 
-    float vc = d1 * d4 - d3 * d2;
+    // Evaluate the projected subtriangle areas directly. Differences of dot
+    // products lose precision for slender triangles, even when their area is
+    // well above the mesh query's degeneracy threshold.
+    vec3 normal = cross(ab, ac);
+    float vc = dot(normal, cross(ab, ap));
     if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) {
         v = d1 / (d1 - d3);
         w = 0.0f;
@@ -85,7 +119,7 @@ CUDA_CALLABLE inline vec2 closest_point_to_triangle(const vec3& a, const vec3& b
         return vec2(u, v);
     }
 
-    float vb = d5 * d2 - d1 * d6;
+    float vb = dot(normal, cross(ap, ac));
     if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) {
         v = 0.0f;
         w = d2 / (d2 - d6);
@@ -93,7 +127,7 @@ CUDA_CALLABLE inline vec2 closest_point_to_triangle(const vec3& a, const vec3& b
         return vec2(u, v);
     }
 
-    float va = d3 * d6 - d5 * d4;
+    float va = dot(normal, cross(bp, cp));
     if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f) {
         w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
         v = 1.0f - w;
@@ -104,7 +138,31 @@ CUDA_CALLABLE inline vec2 closest_point_to_triangle(const vec3& a, const vec3& b
     float denom = 1.0f / (va + vb + vc);
     v = vb * denom;
     w = vc * denom;
+
+    // Enforce tangential projection along the longer edge. For a slender
+    // triangle, small correlated errors in the area ratios otherwise move the
+    // reconstructed point along its long axis. Keep the transverse weight and
+    // recover the other from dot(ab, ap - v*ab - w*ac) = 0 (or the ac equation).
+    float ab_sq = dot(ab, ab);
+    float ac_sq = dot(ac, ac);
+    float ab_ac = dot(ab, ac);
+    if (ab_sq >= ac_sq) {
+        v = (d1 - w * ab_ac) / ab_sq;
+    } else {
+        w = (d2 - v * ab_ac) / ac_sq;
+    }
     u = 1.0f - v - w;
+    if (u < 0.0f || v < 0.0f || w < 0.0f) {
+        // Rounding can disagree with the earlier region predicates near an
+        // edge. Reproject onto the finite boundary instead of extrapolating
+        // outside the triangle or renormalizing inaccurate face weights.
+        const TriangleEdgeProjection boundary = closest_point_to_triangle_boundary(a, b, c, p);
+        if (boundary.edge == 0)
+            return vec2(1.0f - boundary.parameter, boundary.parameter);
+        if (boundary.edge == 1)
+            return vec2(1.0f - boundary.parameter, 0.0f);
+        return vec2(0.0f, 1.0f - boundary.parameter);
+    }
     return vec2(u, v);
 }
 
@@ -796,6 +854,41 @@ CUDA_CALLABLE inline int intersect_tri_tri(vec3d& v0, vec3d& v1, vec3d& v2, vec3
     return NoDivTriTriIsect<double>(&v0[0], &v1[0], &v2[0], &u0[0], &u1[0], &u2[0]);
 }
 
+CUDA_CALLABLE inline void adj_closest_point_to_triangle_boundary(
+    const vec3& a,
+    const vec3& b,
+    const vec3& c,
+    const vec3& p,
+    vec3& adj_a,
+    vec3& adj_b,
+    vec3& adj_c,
+    vec3& adj_p,
+    const vec2& adj_ret
+)
+{
+    const TriangleEdgeProjection boundary = closest_point_to_triangle_boundary(a, b, c, p);
+    const float t = boundary.parameter;
+    // A clamped endpoint has constant barycentric weights.
+    if (t <= 0.0f || t >= 1.0f)
+        return;
+    const vec3 start = boundary.edge == 2 ? b : a;
+    const vec3 end = boundary.edge == 0 ? b : c;
+    const vec3 edge = end - start;
+    const float adj_t = boundary.edge == 0 ? adj_ret[1] - adj_ret[0] : (boundary.edge == 1 ? -adj_ret[0] : -adj_ret[1]);
+    const float factor = adj_t / dot(edge, edge);
+    const vec3 edge_gradient = factor * ((p - start) - 2.0f * t * edge);
+    const vec3 point_gradient = factor * edge;
+    adj_p += point_gradient;
+    if (boundary.edge == 2)
+        adj_b -= edge_gradient + point_gradient;
+    else
+        adj_a -= edge_gradient + point_gradient;
+    if (boundary.edge == 0)
+        adj_b += edge_gradient;
+    else
+        adj_c += edge_gradient;
+}
+
 CUDA_CALLABLE inline void adj_closest_point_to_triangle(
     const vec3& var_a,
     const vec3& var_b,
@@ -813,6 +906,18 @@ CUDA_CALLABLE inline void adj_closest_point_to_triangle(
     vec3 var_0;
     vec3 var_1;
     vec3 var_2;
+    vec3 var_normal;
+    vec3 var_area_a;
+    vec3 var_area_b;
+    vec3 var_area_c;
+    float32 var_face_ab_sq;
+    float32 var_face_ac_sq;
+    float32 var_face_ab_ac;
+    float32 var_face_product;
+    float32 var_face_numerator;
+    float32 var_face_v;
+    float32 var_face_w;
+    bool var_face_ab_longer;
     float32 var_3;
     float32 var_4;
     const float32 var_5 = 0.0;
@@ -829,8 +934,6 @@ CUDA_CALLABLE inline void adj_closest_point_to_triangle(
     bool var_16;
     vec2 var_17;
     vec2 var_18;
-    float32 var_19;
-    float32 var_20;
     float32 var_21;
     float32 var_22;
     float32 var_23;
@@ -849,8 +952,6 @@ CUDA_CALLABLE inline void adj_closest_point_to_triangle(
     bool var_36;
     vec2 var_37;
     vec2 var_38;
-    float32 var_39;
-    float32 var_40;
     float32 var_41;
     float32 var_42;
     float32 var_43;
@@ -861,8 +962,6 @@ CUDA_CALLABLE inline void adj_closest_point_to_triangle(
     float32 var_48 = 0.0;
     vec2 var_49;
     vec2 var_50;
-    float32 var_51;
-    float32 var_52;
     float32 var_53;
     float32 var_54;
     float32 var_55;
@@ -891,6 +990,17 @@ CUDA_CALLABLE inline void adj_closest_point_to_triangle(
     vec3 adj_0 = 0;
     vec3 adj_1 = 0;
     vec3 adj_2 = 0;
+    vec3 adj_normal = 0;
+    vec3 adj_area_a = 0;
+    vec3 adj_area_b = 0;
+    vec3 adj_area_c = 0;
+    float32 adj_face_ab_sq = 0;
+    float32 adj_face_ac_sq = 0;
+    float32 adj_face_ab_ac = 0;
+    float32 adj_face_product = 0;
+    float32 adj_face_numerator = 0;
+    float32 adj_face_v = 0;
+    float32 adj_face_w = 0;
     float32 adj_3 = 0;
     float32 adj_4 = 0;
     float32 adj_5 = 0;
@@ -907,8 +1017,6 @@ CUDA_CALLABLE inline void adj_closest_point_to_triangle(
     bool adj_16 = 0;
     vec2 adj_17 = 0;
     vec2 adj_18 = 0;
-    float32 adj_19 = 0;
-    float32 adj_20 = 0;
     float32 adj_21 = 0;
     float32 adj_22 = 0;
     float32 adj_23 = 0;
@@ -927,8 +1035,6 @@ CUDA_CALLABLE inline void adj_closest_point_to_triangle(
     bool adj_36 = 0;
     vec2 adj_37 = 0;
     vec2 adj_38 = 0;
-    float32 adj_39 = 0;
-    float32 adj_40 = 0;
     float32 adj_41 = 0;
     float32 adj_42 = 0;
     float32 adj_43 = 0;
@@ -939,8 +1045,6 @@ CUDA_CALLABLE inline void adj_closest_point_to_triangle(
     float32 adj_48 = 0;
     vec2 adj_49 = 0;
     vec2 adj_50 = 0;
-    float32 adj_51 = 0;
-    float32 adj_52 = 0;
     float32 adj_53 = 0;
     float32 adj_54 = 0;
     float32 adj_55 = 0;
@@ -969,6 +1073,7 @@ CUDA_CALLABLE inline void adj_closest_point_to_triangle(
     var_0 = wp::sub(var_b, var_a);
     var_1 = wp::sub(var_c, var_a);
     var_2 = wp::sub(var_p, var_a);
+    var_normal = wp::cross(var_0, var_1);
     var_3 = wp::dot(var_0, var_2);
     var_4 = wp::dot(var_1, var_2);
     var_6 = (var_3 <= var_5);
@@ -989,9 +1094,8 @@ CUDA_CALLABLE inline void adj_closest_point_to_triangle(
         goto label1;
     }
     var_18 = wp::where(var_16, var_17, var_10);
-    var_19 = wp::mul(var_3, var_13);
-    var_20 = wp::mul(var_12, var_4);
-    var_21 = wp::sub(var_19, var_20);
+    var_area_c = wp::cross(var_0, var_2);
+    var_21 = wp::dot(var_normal, var_area_c);
     var_22 = wp::sub(var_3, var_12);
     var_23 = wp::div(var_3, var_22);
     var_24 = (var_21 <= var_5);
@@ -1015,9 +1119,8 @@ CUDA_CALLABLE inline void adj_closest_point_to_triangle(
         goto label3;
     }
     var_38 = wp::where(var_36, var_37, var_30);
-    var_39 = wp::mul(var_32, var_4);
-    var_40 = wp::mul(var_3, var_33);
-    var_41 = wp::sub(var_39, var_40);
+    var_area_b = wp::cross(var_2, var_1);
+    var_41 = wp::dot(var_normal, var_area_b);
     var_42 = wp::sub(var_4, var_33);
     var_43 = wp::div(var_4, var_42);
     var_44 = (var_41 <= var_5);
@@ -1030,9 +1133,8 @@ CUDA_CALLABLE inline void adj_closest_point_to_triangle(
         goto label4;
     }
     var_50 = wp::where(var_47, var_49, var_38);
-    var_51 = wp::mul(var_12, var_33);
-    var_52 = wp::mul(var_32, var_13);
-    var_53 = wp::sub(var_51, var_52);
+    var_area_a = wp::cross(var_11, var_31);
+    var_53 = wp::dot(var_normal, var_area_a);
     var_54 = wp::sub(var_13, var_12);
     var_55 = wp::sub(var_13, var_12);
     var_56 = wp::sub(var_32, var_33);
@@ -1055,17 +1157,50 @@ CUDA_CALLABLE inline void adj_closest_point_to_triangle(
     var_70 = wp::div(var_9, var_69);
     var_71 = wp::mul(var_41, var_70);
     var_72 = wp::mul(var_21, var_70);
-    var_73 = wp::sub(var_9, var_71);
-    var_74 = wp::sub(var_73, var_72);
-    // var_75 = wp::vec2(var_74, var_71);
+    var_face_ab_sq = wp::dot(var_0, var_0);
+    var_face_ac_sq = wp::dot(var_1, var_1);
+    var_face_ab_ac = wp::dot(var_0, var_1);
+    var_face_ab_longer = (var_face_ab_sq >= var_face_ac_sq);
+    var_face_v = var_71;
+    var_face_w = var_72;
+    if (var_face_ab_longer) {
+        var_face_product = wp::mul(var_72, var_face_ab_ac);
+        var_face_numerator = wp::sub(var_3, var_face_product);
+        var_face_v = wp::div(var_face_numerator, var_face_ab_sq);
+    } else {
+        var_face_product = wp::mul(var_71, var_face_ab_ac);
+        var_face_numerator = wp::sub(var_4, var_face_product);
+        var_face_w = wp::div(var_face_numerator, var_face_ac_sq);
+    }
+    var_73 = wp::sub(var_9, var_face_v);
+    var_74 = wp::sub(var_73, var_face_w);
+    if (var_74 < 0.0f || var_face_v < 0.0f || var_face_w < 0.0f) {
+        adj_closest_point_to_triangle_boundary(var_a, var_b, var_c, var_p, adj_a, adj_b, adj_c, adj_p, adj_ret);
+        return;
+    }
+    // var_75 = wp::vec2(var_74, var_face_v);
     goto label6;
 //---------
 // reverse
 label6:;
     adj_75 += adj_ret;
-    wp::adj_vec2(var_74, var_71, adj_74, adj_71, adj_75);
-    wp::adj_sub(var_73, var_72, adj_73, adj_72, adj_74);
-    wp::adj_sub(var_9, var_71, adj_9, adj_71, adj_73);
+    wp::adj_vec2(var_74, var_face_v, adj_74, adj_face_v, adj_75);
+    wp::adj_sub(var_73, var_face_w, adj_73, adj_face_w, adj_74);
+    wp::adj_sub(var_9, var_face_v, adj_9, adj_face_v, adj_73);
+    if (var_face_ab_longer) {
+        adj_72 += adj_face_w;
+        wp::adj_div(var_face_numerator, var_face_ab_sq, var_face_v, adj_face_numerator, adj_face_ab_sq, adj_face_v);
+        wp::adj_sub(var_3, var_face_product, adj_3, adj_face_product, adj_face_numerator);
+        wp::adj_mul(var_72, var_face_ab_ac, adj_72, adj_face_ab_ac, adj_face_product);
+    } else {
+        adj_71 += adj_face_v;
+        wp::adj_div(var_face_numerator, var_face_ac_sq, var_face_w, adj_face_numerator, adj_face_ac_sq, adj_face_w);
+        wp::adj_sub(var_4, var_face_product, adj_4, adj_face_product, adj_face_numerator);
+        wp::adj_mul(var_71, var_face_ab_ac, adj_71, adj_face_ab_ac, adj_face_product);
+    }
+    wp::adj_dot(var_0, var_1, adj_0, adj_1, adj_face_ab_ac);
+    wp::adj_dot(var_1, var_1, adj_1, adj_1, adj_face_ac_sq);
+    wp::adj_dot(var_0, var_0, adj_0, adj_0, adj_face_ab_sq);
     wp::adj_mul(var_21, var_70, adj_21, adj_70, adj_72);
     wp::adj_mul(var_41, var_70, adj_41, adj_70, adj_71);
     wp::adj_div(var_9, var_69, var_70, adj_9, adj_69, adj_70);
@@ -1085,9 +1220,8 @@ label6:;
     wp::adj_sub(var_32, var_33, adj_32, adj_33, adj_56);
     wp::adj_sub(var_13, var_12, adj_13, adj_12, adj_55);
     wp::adj_sub(var_13, var_12, adj_13, adj_12, adj_54);
-    wp::adj_sub(var_51, var_52, adj_51, adj_52, adj_53);
-    wp::adj_mul(var_32, var_13, adj_32, adj_13, adj_52);
-    wp::adj_mul(var_12, var_33, adj_12, adj_33, adj_51);
+    wp::adj_dot(var_normal, var_area_a, adj_normal, adj_area_a, adj_53);
+    wp::adj_cross(var_11, var_31, adj_11, adj_31, adj_area_a);
     wp::adj_where(var_47, var_49, var_38, adj_47, adj_49, adj_38, adj_50);
     if (var_47) {
     label4:;
@@ -1097,9 +1231,8 @@ label6:;
     }
     wp::adj_div(var_4, var_42, var_43, adj_4, adj_42, adj_43);
     wp::adj_sub(var_4, var_33, adj_4, adj_33, adj_42);
-    wp::adj_sub(var_39, var_40, adj_39, adj_40, adj_41);
-    wp::adj_mul(var_3, var_33, adj_3, adj_33, adj_40);
-    wp::adj_mul(var_32, var_4, adj_32, adj_4, adj_39);
+    wp::adj_dot(var_normal, var_area_b, adj_normal, adj_area_b, adj_41);
+    wp::adj_cross(var_2, var_1, adj_2, adj_1, adj_area_b);
     wp::adj_where(var_36, var_37, var_30, adj_36, adj_37, adj_30, adj_38);
     if (var_36) {
     label3:;
@@ -1118,9 +1251,8 @@ label6:;
     }
     wp::adj_div(var_3, var_22, var_23, adj_3, adj_22, adj_23);
     wp::adj_sub(var_3, var_12, adj_3, adj_12, adj_22);
-    wp::adj_sub(var_19, var_20, adj_19, adj_20, adj_21);
-    wp::adj_mul(var_12, var_4, adj_12, adj_4, adj_20);
-    wp::adj_mul(var_3, var_13, adj_3, adj_13, adj_19);
+    wp::adj_dot(var_normal, var_area_c, adj_normal, adj_area_c, adj_21);
+    wp::adj_cross(var_0, var_2, adj_0, adj_2, adj_area_c);
     wp::adj_where(var_16, var_17, var_10, adj_16, adj_17, adj_10, adj_18);
     if (var_16) {
     label1:;
@@ -1138,6 +1270,7 @@ label6:;
     wp::adj_dot(var_1, var_2, adj_1, adj_2, adj_4);
     wp::adj_dot(var_0, var_2, adj_0, adj_2, adj_3);
     wp::adj_sub(var_p, var_a, adj_p, adj_a, adj_2);
+    wp::adj_cross(var_0, var_1, adj_0, adj_1, adj_normal);
     wp::adj_sub(var_c, var_a, adj_c, adj_a, adj_1);
     wp::adj_sub(var_b, var_a, adj_b, adj_a, adj_0);
     return;
