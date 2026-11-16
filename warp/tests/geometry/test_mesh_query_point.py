@@ -1968,6 +1968,128 @@ def test_mesh_query_normal_sliver_incident(test, device):
                 np.testing.assert_array_equal(closest, reference_closest)
 
 
+@wp.kernel
+def mesh_query_normal_nearest_face_kernel(
+    mesh: wp.uint64,
+    points: wp.array[wp.vec3],
+    epsilon: float,
+    max_dist: float,
+    results: wp.array2d[float],
+):
+    i = wp.tid()
+    query = wp.mesh_query_point_sign_normal(mesh, points[i], max_dist, epsilon)
+    results[i, 0] = float(query.result)
+    results[i, 1] = query.sign
+    results[i, 2] = float(query.face)
+    sign = float(0.0)
+    face = int(0)
+    u = float(0.0)
+    v = float(0.0)
+    found = wp.mesh_query_point_sign_normal(mesh, points[i], max_dist, sign, face, u, v, epsilon)
+    wp.expect_eq(found, query.result)
+    if found:
+        wp.expect_eq(sign, query.sign)
+        wp.expect_eq(face, query.face)
+        wp.expect_eq(u, query.u)
+        wp.expect_eq(v, query.v)
+
+
+def mesh_query_normal_nearest_face_results(vertices, faces, points, device, epsilon=0.001, max_dist=1.0):
+    mesh = wp.Mesh(
+        points=wp.array(vertices, dtype=wp.vec3, device=device),
+        indices=wp.array(faces.ravel(), dtype=int, device=device),
+        bvh_leaf_size=1,
+    )
+    results = wp.zeros((len(points), 3), dtype=float, device=device)
+    wp.launch(
+        mesh_query_normal_nearest_face_kernel,
+        dim=len(points),
+        inputs=[mesh.id, wp.array(points, dtype=wp.vec3, device=device), epsilon, max_dist],
+        outputs=[results],
+        device=device,
+    )
+    return results.numpy()
+
+
+def test_mesh_query_normal_nearest_face_tie(test, device):
+    # Reduced from three faces of a closed mesh. The first and last triangles
+    # have distinct nearest features whose distances round to the same float32
+    # value. Selecting the first face gives an inside sign for an exterior query.
+    # The middle sliver remains excluded by the inherited quality threshold.
+    vertices = np.array(
+        [
+            [0.007000000216066837, 0.007749998942017555, 0.04920000210404396],
+            [0.011449994519352913, 0.008949999697506428, 0.04920000210404396],
+            [0.011449994519352913, 0.00774999987334013, 0.04920000210404396],
+            [0.012449996545910835, 0.00774999987334013, 0.04919999837875366],
+            [0.012450000271201134, 0.007749998942017555, 0.05640000104904175],
+        ],
+        np.float32,
+    )
+    faces = np.array([[0, 1, 2], [0, 2, 3], [4, 0, 3]], np.int32)
+    exterior = np.array(
+        [
+            [0.010264541022479534, -0.007100006099790335, 0.049200162291526794],
+            [0.01026445534080267, -0.0071000210009515285, 0.04920033738017082],
+            [0.010264500044286251, -0.007100009825080633, 0.04920000210404396],
+        ],
+        np.float32,
+    )
+    center = vertices[faces[2]].mean(axis=0)
+    offset = np.array([0, 0.001, 0], np.float32)
+    points = np.vstack((exterior, center - offset, center + offset))
+    for scale, reverse, shift, epsilon in itertools.product((0.5, 1.0, 2.0), (False, True), range(3), (0.0, 0.001)):
+        with test.subTest(scale=scale, reverse=reverse, shift=shift, epsilon=epsilon):
+            f = np.roll(faces[::-1] if reverse else faces, shift, axis=1).copy()
+            result = mesh_query_normal_nearest_face_results(
+                vertices * scale, f, points * scale, device, epsilon, max_dist=0.02 * scale
+            )
+            np.testing.assert_array_equal(result[:, 0], 1)
+            np.testing.assert_array_equal(result[:, 1], [1, 1, 1, 1, -1])
+            # Compare the physical face after remapping the face order.
+            np.testing.assert_array_equal(result[:, 2], 0 if reverse else 2)
+    # Finite radii near the original query distance preserve hit/miss behavior.
+    for max_dist, expected in ((0.01484, 0), (0.01486, 1)):
+        result = mesh_query_normal_nearest_face_results(vertices, faces, exterior, device, max_dist=max_dist)
+        np.testing.assert_array_equal(result[:, 0], expected)
+    # A single open face has a meaningful negative side even outside its AABB.
+    # A universal outside-AABB sign shortcut would incorrectly make it positive.
+    result = mesh_query_normal_nearest_face_results(vertices, faces[2:], points[-2:], device)
+    np.testing.assert_array_equal(result[:, 0], 1)
+    np.testing.assert_array_equal(result[:, 1], [1, -1])
+
+
+def test_mesh_query_normal_radius_boundary(test, device):
+    vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], np.float32)
+    faces = np.array([[0, 1, 2]], np.int32)
+    # Face, edge, and vertex projections are all exactly 0.25 from the surface;
+    # the final point lies exactly on an edge of the triangle.
+    points = np.array([[0.25, 0.25, 0.25], [0.5, 0, 0.25], [0, 0, 0.25], [0.5, 0, 0]], np.float32)
+    for max_dist, expected in (
+        (-0.25, [0, 0, 0, 0]),
+        (0.0, [0, 0, 0, 0]),
+        (0.25, [0, 0, 0, 1]),
+        (float(np.nextafter(np.float32(0.25), np.float32(np.inf))), [1, 1, 1, 1]),
+    ):
+        with test.subTest(max_dist=max_dist):
+            result = mesh_query_normal_nearest_face_results(vertices, faces, points, device, max_dist=max_dist)
+            np.testing.assert_array_equal(result[:, 0], expected)
+            if expected[0]:
+                np.testing.assert_array_equal(result[:3, 1], 1)
+                np.testing.assert_array_equal(result[:, 2], 0)
+    for max_dist in (float(np.finfo(np.float32).max), float("inf")):
+        with test.subTest(max_dist=max_dist, geometry="ordinary"):
+            result = mesh_query_normal_nearest_face_results(vertices, faces, points, device, max_dist=max_dist)
+            np.testing.assert_array_equal(result[:, 0], 1)
+            np.testing.assert_array_equal(result[:3, 1], 1)
+        # A zero-area triangle is not a surface, even with an unbounded radius.
+        # Coincident vertices exercise the 0/0 triangle-quality case as well.
+        for degenerate in (np.zeros((3, 3), np.float32), np.array([[0, 0, 0], [1, 0, 0], [2, 0, 0]], np.float32)):
+            with test.subTest(max_dist=max_dist, geometry=degenerate.tolist()):
+                result = mesh_query_normal_nearest_face_results(degenerate, faces, points, device, max_dist=max_dist)
+                np.testing.assert_array_equal(result[:, 0], 0)
+
+
 devices = get_test_devices()
 
 
@@ -2071,6 +2193,18 @@ add_function_test(
     TestMeshQueryPoint,
     "test_mesh_query_normal_sliver_incident",
     test_mesh_query_normal_sliver_incident,
+    devices=devices,
+)
+add_function_test(
+    TestMeshQueryPoint,
+    "test_mesh_query_normal_nearest_face_tie",
+    test_mesh_query_normal_nearest_face_tie,
+    devices=devices,
+)
+add_function_test(
+    TestMeshQueryPoint,
+    "test_mesh_query_normal_radius_boundary",
+    test_mesh_query_normal_radius_boundary,
     devices=devices,
 )
 

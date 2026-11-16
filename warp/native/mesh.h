@@ -621,6 +621,156 @@ mesh_query_furthest_point_no_sign(uint64_t id, const vec3& point, float min_dist
     }
 }
 
+// A lower bound for NORMAL's nearest-feature traversal. Compute from the
+// represented float coordinates in double, including the subtractions. The
+// small relative reduction covers rounding in the three squared differences
+// and their sum; it is not a geometric tolerance or a contact margin.
+CUDA_CALLABLE inline double
+mesh_query_normal_aabb_distance_sq(const vec3d& point, const BVHPackedNodeHalf& lower, const BVHPackedNodeHalf& upper)
+{
+    const double dx = min(double(upper.x), max(double(lower.x), point[0])) - point[0];
+    const double dy = min(double(upper.y), max(double(lower.y), point[1])) - point[1];
+    const double dz = min(double(upper.z), max(double(lower.z), point[2])) - point[2];
+    return (dx * dx + dy * dy + dz * dz) * (1.0 - 8.0 * DBL_EPSILON);
+}
+
+// Return a finite triangle's squared distance and nonnegative barycentric
+// weights without first rounding the projected point or weights to float.
+CUDA_CALLABLE inline double mesh_query_normal_triangle_distance_sq(
+    const vec3d& a, const vec3d& b, const vec3d& c, const vec3d& point, vec3d& barycentric
+)
+{
+    const vec3d n = cross(b - a, c - a);
+    const double n_sq = dot(n, n);
+    const double h0 = dot(cross(b - a, point - a), n);
+    const double h1 = dot(cross(c - b, point - b), n);
+    const double h2 = dot(cross(a - c, point - c), n);
+    if (n_sq > 0.0 && h0 >= 0.0 && h1 >= 0.0 && h2 >= 0.0) {
+        barycentric = vec3d(h1, h2, h0) / (h0 + h1 + h2);
+        const double height = dot(n, point - a);
+        return height * height / n_sq;
+    }
+
+    const vec3d vertices[3] = { a, b, c };
+    double best_sq = DBL_MAX;
+    for (int k = 0; k < 3; ++k) {
+        const int next = (k + 1) % 3;
+        const vec3d edge = vertices[next] - vertices[k];
+        const double edge_sq = dot(edge, edge);
+        if (edge_sq == 0.0)
+            continue;
+        const double t = clamp(dot(point - vertices[k], edge) / edge_sq, 0.0, 1.0);
+        const vec3d delta = t <= 0.5 ? (point - vertices[k]) - t * edge : (point - vertices[next]) + (1.0 - t) * edge;
+        const double distance_sq = dot(delta, delta);
+        if (distance_sq < best_sq) {
+            best_sq = distance_sq;
+            barycentric = vec3d(0.0);
+            barycentric[k] = 1.0 - t;
+            barycentric[next] = t;
+        }
+    }
+    return best_sq;
+}
+
+// NORMAL needs the actual nearest eligible feature, not one selected by a
+// float squared-distance tie: an adjacent face can have the opposite sign.
+// Keep this higher-precision search private to NORMAL; unsigned and parity
+// queries retain their existing paths.
+CUDA_CALLABLE inline bool
+mesh_query_point_normal_closest(uint64_t id, const vec3& point, float max_dist, int& face, float& u, float& v)
+{
+    if (!(max_dist > 0.0f))
+        return false;
+
+    Mesh mesh = mesh_get(id);
+    const vec3d x(point);
+    const double max_dist_sq = double(max_dist) * double(max_dist);
+    double min_dist_sq = max_dist_sq;
+    double search_radius_sq = max_dist_sq;
+    int min_face = -1;
+    vec3d min_barycentric;
+    int stack[BVH_QUERY_STACK_SIZE];
+    stack[0] = *mesh.bvh.root;
+    int count = 1;
+    while (count) {
+        const int node_index = stack[--count];
+        const BVHPackedNodeHalf lower = bvh_load_node(mesh.bvh.node_lowers, node_index);
+        const BVHPackedNodeHalf upper = bvh_load_node(mesh.bvh.node_uppers, node_index);
+        if (mesh_query_normal_aabb_distance_sq(x, lower, upper) > search_radius_sq)
+            continue;
+
+        if (lower.b) {
+            for (int primitive_counter = lower.i; primitive_counter < upper.i; ++primitive_counter) {
+                const int candidate = bvh_load_int(mesh.bvh.primitive_indices, primitive_counter);
+                const vec3 p = mesh.points[bvh_load_int(mesh.indices, candidate * 3)];
+                const vec3 q = mesh.points[bvh_load_int(mesh.indices, candidate * 3 + 1)];
+                const vec3 r = mesh.points[bvh_load_int(mesh.indices, candidate * 3 + 2)];
+                const vec3 e0 = q - p;
+                const vec3 e1 = r - p;
+                const vec3 e2 = r - q;
+                // Preserve the inherited float32 eligibility predicate and
+                // original triangle order, also used by the normal fan below.
+                if (length(cross(e0, e1)) / (dot(e0, e0) + dot(e1, e1) + dot(e2, e2)) < 1.e-6f)
+                    continue;
+
+                const vec3d a(p);
+                const vec3d b(q);
+                const vec3d c(r);
+                vec3d barycentric;
+                const double distance_sq = mesh_query_normal_triangle_distance_sq(a, b, c, x, barycentric);
+                if (distance_sq < min_dist_sq && distance_sq < DBL_MAX) {
+                    min_dist_sq = distance_sq;
+                    min_face = candidate;
+                    min_barycentric = barycentric;
+
+                    // A normalized nonnegative weighted point belongs to the
+                    // triangle even if its projection weights have rounding
+                    // error. Its distance therefore gives an upper bound for
+                    // pruning, independently of the face-distance calculation.
+                    const vec3d da = a - x;
+                    const vec3d db = b - x;
+                    const vec3d dc = c - x;
+                    const double weight_sum = barycentric[0] + barycentric[1] + barycentric[2];
+                    const vec3d delta = (barycentric[0] * da + barycentric[1] * db + barycentric[2] * dc) / weight_sum;
+                    // Cover the rounded weighted sum, normalization and norm.
+                    // Only traversal is expanded; acceptance stays strictly
+                    // inside max_dist, without any spatial tolerance.
+                    const double roundoff = 32.0 * DBL_EPSILON * (length(da) + length(db) + length(dc));
+                    const double radius = length(delta) + roundoff;
+                    const double radius_sq = max(distance_sq, radius * radius * (1.0 + 8.0 * DBL_EPSILON));
+                    search_radius_sq = min(search_radius_sq, radius_sq);
+                }
+            }
+        } else {
+            const int left_index = lower.i;
+            const int right_index = upper.i;
+            const double left_distance = mesh_query_normal_aabb_distance_sq(
+                x, bvh_load_node(mesh.bvh.node_lowers, left_index), bvh_load_node(mesh.bvh.node_uppers, left_index)
+            );
+            const double right_distance = mesh_query_normal_aabb_distance_sq(
+                x, bvh_load_node(mesh.bvh.node_lowers, right_index), bvh_load_node(mesh.bvh.node_uppers, right_index)
+            );
+            const int far_index = left_distance < right_distance ? right_index : left_index;
+            const int near_index = left_distance < right_distance ? left_index : right_index;
+            const double far_distance = max(left_distance, right_distance);
+            const double near_distance = min(left_distance, right_distance);
+            if (far_distance <= search_radius_sq)
+                stack[count++] = far_index;
+            if (near_distance <= search_radius_sq)
+                stack[count++] = near_index;
+        }
+    }
+
+    if (min_face < 0)
+        return false;
+    const float min_v = float(min_barycentric[1]);
+    const float min_w = float(min_barycentric[2]);
+    u = 1.0f - min_v - min_w;
+    v = min_v;
+    face = min_face;
+    return true;
+}
+
 // returns true if there is a point (strictly) < distance max_dist
 // Select a single geometric closest feature before accumulating its normals.
 // Distance ties alone do not establish incidence: unrelated features can have
@@ -636,7 +786,7 @@ CUDA_CALLABLE inline bool mesh_query_point_sign_normal(
     const float epsilon = 1e-3f
 )
 {
-    if (max_dist <= 0.0f || !mesh_query_point_no_sign(id, point, max_dist, face, u, v))
+    if (!mesh_query_point_normal_closest(id, point, max_dist, face, u, v))
         return false;
 
     Mesh mesh = mesh_get(id);
