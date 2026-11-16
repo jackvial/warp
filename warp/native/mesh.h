@@ -621,17 +621,113 @@ mesh_query_furthest_point_no_sign(uint64_t id, const vec3& point, float min_dist
     }
 }
 
-// A lower bound for NORMAL's nearest-feature traversal. Compute from the
-// represented float coordinates in double, including the subtractions. The
-// small relative reduction covers rounding in the three squared differences
-// and their sum; it is not a geometric tolerance or a contact margin.
-CUDA_CALLABLE inline double
-mesh_query_normal_aabb_distance_sq(const vec3d& point, const BVHPackedNodeHalf& lower, const BVHPackedNodeHalf& upper)
+// A conservative float lower bound. Uncertain arithmetic yields zero, so it
+// cannot prune a potentially closer feature. Nonzero differences must be large
+// enough to square normally; the reduction covers subtraction, squares and sum.
+CUDA_CALLABLE inline float mesh_query_normal_aabb_distance_sq(const vec3& point, const vec3& lower, const vec3& upper)
 {
-    const double dx = min(double(upper.x), max(double(lower.x), point[0])) - point[0];
-    const double dy = min(double(upper.y), max(double(lower.y), point[1])) - point[1];
-    const double dz = min(double(upper.z), max(double(lower.z), point[2])) - point[2];
-    return (dx * dx + dy * dy + dz * dz) * (1.0 - 8.0 * DBL_EPSILON);
+    const float dx = min(upper[0], max(lower[0], point[0])) - point[0];
+    const float dy = min(upper[1], max(lower[1], point[1])) - point[1];
+    const float dz = min(upper[2], max(lower[2], point[2])) - point[2];
+    // sqrt(FLT_MIN), exactly represented. A flushed zero only omits a
+    // nonnegative contribution; a nonzero tiny difference falls back instead.
+    const float min_difference = 1.0842021724855044e-19f;
+    if ((dx != 0.0f && fabs(dx) < min_difference) || (dy != 0.0f && fabs(dy) < min_difference)
+        || (dz != 0.0f && fabs(dz) < min_difference))
+        return 0.0f;
+    const float distance_sq = dx * dx + dy * dy + dz * dz;
+    if (!isfinite(distance_sq))
+        return 0.0f;
+    return distance_sq * (1.0f - 8.0f * FLT_EPSILON);
+}
+
+CUDA_CALLABLE inline float
+mesh_query_normal_aabb_distance_sq(const vec3& point, const BVHPackedNodeHalf& lower, const BVHPackedNodeHalf& upper)
+{
+    return mesh_query_normal_aabb_distance_sq(point, vec3(lower.x, lower.y, lower.z), vec3(upper.x, upper.y, upper.z));
+}
+
+// Round the traversal radius outward, without changing strict DP acceptance.
+CUDA_CALLABLE inline float mesh_query_normal_radius_upper(double radius_sq)
+{
+    const float radius = float(radius_sq);
+    if (radius < FLT_MIN)
+        return FLT_MIN;
+    return radius * (1.0f + 2.0f * FLT_EPSILON);
+}
+
+CUDA_CALLABLE inline bool mesh_query_normal_same_coordinate(float a, float b)
+{
+    unsigned int a_bits;
+    unsigned int b_bits;
+    memcpy(&a_bits, &a, sizeof(a_bits));
+    memcpy(&b_bits, &b, sizeof(b_bits));
+    return a_bits == b_bits || ((a_bits | b_bits) & 0x7fffffffu) == 0;
+}
+
+// Lower bound for d dot (vertex - point), with d already interpreted as an
+// exact represented direction. The relative allowance exceeds the error of
+// subtraction, three products and two sums, including computing their absolute
+// sum. The absolute term covers flushed source operands/products for |d_i|<=2.
+CUDA_CALLABLE inline float mesh_query_normal_support_lower(const vec3& vertex, const vec3& point, const vec3& direction)
+{
+    const vec3 delta = vertex - point;
+    for (int k = 0; k < 3; ++k) {
+        if (!isfinite(delta[k]))
+            return 0.0f;
+        if (fabs(delta[k]) < FLT_MIN && !mesh_query_normal_same_coordinate(vertex[k], point[k]))
+            return 0.0f;
+    }
+    const float p0 = direction[0] * delta[0];
+    const float p1 = direction[1] * delta[1];
+    const float p2 = direction[2] * delta[2];
+    const float support = p0 + p1 + p2;
+    const float absolute_sum = fabs(p0) + fabs(p1) + fabs(p2);
+    if (!isfinite(support) || !isfinite(absolute_sum))
+        return 0.0f;
+    const float error = 16.0f * FLT_EPSILON * absolute_sum + 32.0f * FLT_MIN;
+    return max(0.0f, (support - error) * (1.0f - 2.0f * FLT_EPSILON));
+}
+
+// Any direction gives a supporting-plane distance lower bound. An approximate
+// closest point only supplies this direction; its accuracy is NOT assumed.
+// Poor projections and uncertain arithmetic simply keep the DP candidate.
+CUDA_CALLABLE inline bool mesh_query_normal_triangle_farther(
+    const vec3& a, const vec3& b, const vec3& c, const vec3& point, float radius_upper_sq
+)
+{
+    if (!isfinite(radius_upper_sq))
+        return false;
+    const vec2 uv = closest_point_to_triangle(a, b, c, point);
+    vec3 direction = mesh_query_triangle_point_delta(a, b, c, point, uv[0], uv[1], 1.0f - uv[0] - uv[1]);
+    const float scale = max(fabs(direction[0]), max(fabs(direction[1]), fabs(direction[2])));
+    if (!(scale > 0.0f) || !isfinite(scale))
+        return false;
+    const float inverse_scale = 1.0f / scale;
+    if (!isfinite(inverse_scale))
+        return false;
+    direction = direction * inverse_scale;
+    for (int k = 0; k < 3; ++k) {
+        if (!isfinite(direction[k]) || fabs(direction[k]) > 2.0f)
+            return false;
+        // Do not let DAZ erase a tiny coefficient after it has been amplified
+        // by a large coordinate. This NEW represented direction is arbitrary
+        // but valid for the support-plane bound, including explicit zeros.
+        if (fabs(direction[k]) < FLT_MIN)
+            direction[k] = 0.0f;
+    }
+    const float support = min(
+        mesh_query_normal_support_lower(a, point, direction),
+        min(mesh_query_normal_support_lower(b, point, direction), mesh_query_normal_support_lower(c, point, direction))
+    );
+    if (!(support > 0.0f))
+        return false;
+    const float support_sq = support * support;
+    const float norm_upper_sq = dot(direction, direction) * (1.0f + 8.0f * FLT_EPSILON);
+    const float radius_norm_sq = radius_upper_sq * norm_upper_sq;
+    if (!isfinite(support_sq) || !isfinite(radius_norm_sq) || support_sq < FLT_MIN || radius_norm_sq < FLT_MIN)
+        return false;
+    return support_sq * (1.0f - 4.0f * FLT_EPSILON) > radius_norm_sq * (1.0f + 4.0f * FLT_EPSILON);
 }
 
 // Return a finite triangle's squared distance and nonnegative barycentric
@@ -687,6 +783,7 @@ mesh_query_point_normal_closest(uint64_t id, const vec3& point, float max_dist, 
     const double max_dist_sq = double(max_dist) * double(max_dist);
     double min_dist_sq = max_dist_sq;
     double search_radius_sq = max_dist_sq;
+    float search_radius_upper_sq = mesh_query_normal_radius_upper(search_radius_sq);
     int min_face = -1;
     vec3d min_barycentric;
     int stack[BVH_QUERY_STACK_SIZE];
@@ -696,7 +793,7 @@ mesh_query_point_normal_closest(uint64_t id, const vec3& point, float max_dist, 
         const int node_index = stack[--count];
         const BVHPackedNodeHalf lower = bvh_load_node(mesh.bvh.node_lowers, node_index);
         const BVHPackedNodeHalf upper = bvh_load_node(mesh.bvh.node_uppers, node_index);
-        if (mesh_query_normal_aabb_distance_sq(x, lower, upper) > search_radius_sq)
+        if (mesh_query_normal_aabb_distance_sq(point, lower, upper) > search_radius_upper_sq)
             continue;
 
         if (lower.b) {
@@ -711,6 +808,17 @@ mesh_query_point_normal_closest(uint64_t id, const vec3& point, float max_dist, 
                 // Preserve the inherited float32 eligibility predicate and
                 // original triangle order, also used by the normal fan below.
                 if (length(cross(e0, e1)) / (dot(e0, e0) + dot(e1, e1) + dot(e2, e2)) < 1.e-6f)
+                    continue;
+
+                const vec3 triangle_lower(
+                    min(p[0], min(q[0], r[0])), min(p[1], min(q[1], r[1])), min(p[2], min(q[2], r[2]))
+                );
+                const vec3 triangle_upper(
+                    max(p[0], max(q[0], r[0])), max(p[1], max(q[1], r[1])), max(p[2], max(q[2], r[2]))
+                );
+                if (mesh_query_normal_aabb_distance_sq(point, triangle_lower, triangle_upper) > search_radius_upper_sq)
+                    continue;
+                if (mesh_query_normal_triangle_farther(p, q, r, point, search_radius_upper_sq))
                     continue;
 
                 const vec3d a(p);
@@ -735,28 +843,38 @@ mesh_query_point_normal_closest(uint64_t id, const vec3& point, float max_dist, 
                     // Cover the rounded weighted sum, normalization and norm.
                     // Only traversal is expanded; acceptance stays strictly
                     // inside max_dist, without any spatial tolerance.
-                    const double roundoff = 32.0 * DBL_EPSILON * (length(da) + length(db) + length(dc));
-                    const double radius = length(delta) + roundoff;
-                    const double radius_sq = max(distance_sq, radius * radius * (1.0 + 8.0 * DBL_EPSILON));
+                    const double input_l1 = fabs(da[0]) + fabs(da[1]) + fabs(da[2]) + fabs(db[0]) + fabs(db[1])
+                        + fabs(db[2]) + fabs(dc[0]) + fabs(dc[1]) + fabs(dc[2]);
+                    const double delta_l1 = fabs(delta[0]) + fabs(delta[1]) + fabs(delta[2]);
+                    const double roundoff = 32.0 * DBL_EPSILON * input_l1;
+                    // ||delta||_1 >= ||delta||_2 bounds the cross term without
+                    // the four double square roots used by a norm-radius sum.
+                    const double radius_sq = max(
+                        distance_sq,
+                        (dot(delta, delta) + 2.0 * roundoff * delta_l1 + roundoff * roundoff)
+                            * (1.0 + 8.0 * DBL_EPSILON)
+                    );
                     search_radius_sq = min(search_radius_sq, radius_sq);
+                    search_radius_upper_sq = mesh_query_normal_radius_upper(search_radius_sq);
                 }
             }
         } else {
             const int left_index = lower.i;
             const int right_index = upper.i;
-            const double left_distance = mesh_query_normal_aabb_distance_sq(
-                x, bvh_load_node(mesh.bvh.node_lowers, left_index), bvh_load_node(mesh.bvh.node_uppers, left_index)
+            const float left_distance = mesh_query_normal_aabb_distance_sq(
+                point, bvh_load_node(mesh.bvh.node_lowers, left_index), bvh_load_node(mesh.bvh.node_uppers, left_index)
             );
-            const double right_distance = mesh_query_normal_aabb_distance_sq(
-                x, bvh_load_node(mesh.bvh.node_lowers, right_index), bvh_load_node(mesh.bvh.node_uppers, right_index)
+            const float right_distance = mesh_query_normal_aabb_distance_sq(
+                point, bvh_load_node(mesh.bvh.node_lowers, right_index),
+                bvh_load_node(mesh.bvh.node_uppers, right_index)
             );
             const int far_index = left_distance < right_distance ? right_index : left_index;
             const int near_index = left_distance < right_distance ? left_index : right_index;
-            const double far_distance = max(left_distance, right_distance);
-            const double near_distance = min(left_distance, right_distance);
-            if (far_distance <= search_radius_sq)
+            const float far_distance = max(left_distance, right_distance);
+            const float near_distance = min(left_distance, right_distance);
+            if (far_distance <= search_radius_upper_sq)
                 stack[count++] = far_index;
-            if (near_distance <= search_radius_sq)
+            if (near_distance <= search_radius_upper_sq)
                 stack[count++] = near_index;
         }
     }
