@@ -708,6 +708,15 @@ CUDA_CALLABLE inline bool mesh_query_point_sign_normal(
         }
         if (anchor < 0 || (!is_vertex && !has_other))
             continue;
+        // Keep the same eligible triangles as the closest-face search. A
+        // near-collinear face can have an unstable unit normal which would
+        // otherwise outweigh a valid face at their shared edge. Evaluate the
+        // inherited float32 predicate in the original triangle order.
+        const vec3 fe0 = fv[1] - fv[0];
+        const vec3 fe1 = fv[2] - fv[0];
+        const vec3 fe2 = fv[2] - fv[1];
+        if (length(cross(fe0, fe1)) / (dot(fe0, fe0) + dot(fe1, fe1) + dot(fe2, fe2)) < 1.e-6f)
+            continue;
         const vec3d p(fv[anchor]);
         const vec3d e0 = vec3d(fv[(anchor + 1) % 3]) - p;
         const vec3d e1 = vec3d(fv[(anchor + 2) % 3]) - p;

@@ -11003,8 +11003,9 @@ add_builtin(
     not supported. Closest-face selection still uses floating-point distance comparisons.
 
     Triangles that are degenerate or nearly degenerate relative to their edge lengths are excluded from
-    the closest-point search, so such a face can be skipped even when it satisfies the distance
-    constraint. If every face satisfying the distance constraint is excluded, the query returns no result.
+    the closest-point search and from incident-normal accumulation. Such a face can be skipped
+    even when it satisfies the distance constraint. If every face satisfying the distance
+    constraint is excluded, the query returns no result.
 
     Args:
         id: The mesh identifier
@@ -11049,8 +11050,9 @@ add_builtin(
     not supported. Closest-face selection still uses floating-point distance comparisons.
 
     Triangles that are degenerate or nearly degenerate relative to their edge lengths are excluded from
-    the closest-point search, so such a face can be skipped even when it satisfies the distance
-    constraint. If every face satisfying the distance constraint is excluded, the query returns no result.
+    the closest-point search and from incident-normal accumulation. Such a face can be skipped
+    even when it satisfies the distance constraint. If every face satisfying the distance
+    constraint is excluded, the query returns no result.
 
     Args:
         id: The mesh identifier

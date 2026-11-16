@@ -1915,6 +1915,59 @@ def test_mesh_query_normal_disconnected_surfaces(test, device):
     np.testing.assert_array_equal(result[:, 0], 0)
 
 
+def test_mesh_query_normal_sliver_incident(test, device):
+    # The nearest-face search excludes nearly degenerate triangles. Such a
+    # triangle must not re-enter through the incident-normal accumulation pass:
+    # normalizing its tiny area can give it the same weight as a healthy face.
+    # The first fixture reduces a closed keeper mesh to its two incident faces.
+    # The second is an analytic -Z-oriented plane with a skinny +Y face.
+    fixtures = (
+        (
+            np.array(
+                [
+                    [0.007000000216066837, 0.007749998942017555, 0.04920000210404396],
+                    [0.011449994519352913, 0.008949999697506428, 0.04920000210404396],
+                    [0.011449994519352913, 0.00774999987334013, 0.04920000210404396],
+                    [0.012449996545910835, 0.00774999987334013, 0.04919999837875366],
+                ],
+                np.float32,
+            ),
+            np.array([0.007052569650113583, 0.005699979607015848, 0.047312378883361816], np.float32),
+        ),
+        (
+            np.array([[0, 0, 0], [1, 1, 0], [1, 0, 0], [2, 0, -1e-7]], np.float32),
+            np.array([0.5, -2, -1], np.float32),
+        ),
+    )
+    faces = np.array([[0, 1, 2], [0, 2, 3]], np.int32)
+    for fixture_index, (vertices, outside) in enumerate(fixtures):
+        opposite = outside.copy()
+        opposite[2] = 2 * vertices[0, 2] - opposite[2]
+        center = vertices[:3].mean(axis=0)
+        offset = np.array([0, 0, abs(float(outside[2] - vertices[0, 2]))])
+        points = np.array([outside, opposite, center - offset, center + offset], np.float32)
+        for scale, epsilon, reverse, shift in itertools.product(
+            (0.0625, 1.0, 16.0), (0.0, 0.001), (False, True), range(3)
+        ):
+            with test.subTest(fixture=fixture_index, scale=scale, epsilon=epsilon, reverse=reverse, shift=shift):
+                v = vertices * scale
+                p = points * scale
+                sliver = v[faces[1]]
+                e0, e1, e2 = sliver[1] - sliver[0], sliver[2] - sliver[0], sliver[2] - sliver[1]
+                quality = np.linalg.norm(np.cross(e0, e1)) / (np.dot(e0, e0) + np.dot(e1, e1) + np.dot(e2, e2))
+                test.assertGreater(float(quality), 0.0)
+                test.assertLess(float(quality), 1.0e-6)
+                f = np.roll(faces[::-1] if reverse else faces, shift, axis=1).copy()
+                eligible = np.roll(faces[:1], shift, axis=1).copy()
+                reference, reference_closest = mesh_query_normal_feature_results(v, eligible, p, device, epsilon)
+                result, closest = mesh_query_normal_feature_results(v, f, p, device, epsilon)
+                np.testing.assert_array_equal(reference[:, 0], 1)
+                np.testing.assert_array_equal(reference[:, 1], [1, -1, 1, -1])
+                np.testing.assert_array_equal(result[:, 0], reference[:, 0])
+                np.testing.assert_array_equal(result[:, 1], reference[:, 1])
+                np.testing.assert_array_equal(closest, reference_closest)
+
+
 devices = get_test_devices()
 
 
@@ -2012,6 +2065,12 @@ add_function_test(
     TestMeshQueryPoint,
     "test_mesh_query_normal_disconnected_surfaces",
     test_mesh_query_normal_disconnected_surfaces,
+    devices=devices,
+)
+add_function_test(
+    TestMeshQueryPoint,
+    "test_mesh_query_normal_sliver_incident",
+    test_mesh_query_normal_sliver_incident,
     devices=devices,
 )
 
