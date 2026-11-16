@@ -10992,9 +10992,15 @@ add_builtin(
     group="Geometry",
     doc="""Compute the closest point on the :class:`warp.Mesh` with identifier ``id`` to the given ``point`` in space.
 
-    Identifies the sign of the distance (inside/outside) using the angle-weighted pseudo normal.
-    This approach to sign determination is robust for well conditioned meshes that are watertight and non-self intersecting.
-    It is also comparatively fast to compute.
+    Identifies the sign of the distance (inside/outside) using the pseudo normal of the closest
+    geometric feature. Face normals, equal-weighted incident edge normals, and angle-weighted
+    incident vertex normals determine the sign. Incident triangles must share exactly matching
+    endpoint coordinates; distinct vertex indices at identical coordinates are supported.
+
+    Closed, consistently oriented, conforming meshes without self-intersections are required
+    for an inside/outside interpretation. On open meshes the sign describes the local oriented
+    side, not containment. Nonconforming T-junctions and coincident intersecting components are
+    not supported. Closest-face selection still uses floating-point distance comparisons.
 
     Triangles that are degenerate or nearly degenerate relative to their edge lengths are excluded from
     the closest-point search, so such a face can be skipped even when it satisfies the distance
@@ -11009,8 +11015,9 @@ add_builtin(
         face: Returns the index of the closest face
         bary_u: Returns the barycentric u coordinate of the closest point
         bary_v: Returns the barycentric v coordinate of the closest point
-        epsilon: Epsilon treating distance values as equal, when locating the minimum distance vertex/face/edge, as a
-            fraction of the average edge length, also for treating closest point as being on edge/vertex default 1e-3
+        epsilon: Nonnegative BVH search padding as a fraction of the average edge length.
+            Negative values use zero padding. This does not merge different features, snap the
+            closest point to an edge or vertex, or change normal weights.
 
     Returns:
         ``True`` if a point < ``max_dist`` is found.""",
@@ -11031,9 +11038,15 @@ add_builtin(
     group="Geometry",
     doc="""Compute the closest point on the :class:`warp.Mesh` with identifier ``id`` to the given ``point`` in space.
 
-    Identifies the sign of the distance (inside/outside) using the angle-weighted pseudo normal.
-    This approach to sign determination is robust for well conditioned meshes that are watertight and non-self intersecting.
-    It is also comparatively fast to compute.
+    Identifies the sign of the distance (inside/outside) using the pseudo normal of the closest
+    geometric feature. Face normals, equal-weighted incident edge normals, and angle-weighted
+    incident vertex normals determine the sign. Incident triangles must share exactly matching
+    endpoint coordinates; distinct vertex indices at identical coordinates are supported.
+
+    Closed, consistently oriented, conforming meshes without self-intersections are required
+    for an inside/outside interpretation. On open meshes the sign describes the local oriented
+    side, not containment. Nonconforming T-junctions and coincident intersecting components are
+    not supported. Closest-face selection still uses floating-point distance comparisons.
 
     Triangles that are degenerate or nearly degenerate relative to their edge lengths are excluded from
     the closest-point search, so such a face can be skipped even when it satisfies the distance
@@ -11043,8 +11056,9 @@ add_builtin(
         id: The mesh identifier
         point: The query point, in the mesh's local space
         max_dist: Maximum allowed distance to the returned closest point. The query returns no result if no face is strictly closer than this distance.
-        epsilon: Epsilon treating distance values as equal, when locating the minimum distance vertex/face/edge, as a
-            fraction of the average edge length, also for treating closest point as being on edge/vertex.
+        epsilon: Nonnegative BVH search padding as a fraction of the average edge length.
+            Negative values use zero padding. This does not merge different features, snap the
+            closest point to an edge or vertex, or change normal weights.
 
     Returns:
         A :class:`warp.MeshQueryPoint`. Check ``result`` first (``True`` if a face within

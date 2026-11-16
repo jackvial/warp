@@ -622,6 +622,9 @@ mesh_query_furthest_point_no_sign(uint64_t id, const vec3& point, float min_dist
 }
 
 // returns true if there is a point (strictly) < distance max_dist
+// Select a single geometric closest feature before accumulating its normals.
+// Distance ties alone do not establish incidence: unrelated features can have
+// arbitrarily similar distances to a query far from the mesh.
 CUDA_CALLABLE inline bool mesh_query_point_sign_normal(
     uint64_t id,
     const vec3& point,
@@ -633,176 +636,90 @@ CUDA_CALLABLE inline bool mesh_query_point_sign_normal(
     const float epsilon = 1e-3f
 )
 {
-    Mesh mesh = mesh_get(id);
-
-    int stack[BVH_QUERY_STACK_SIZE];
-    stack[0] = *mesh.bvh.root;
-    int count = 1;
-    float min_dist = max_dist;
-    int min_face;
-    float min_v;
-    float min_w;
-    vec3 accumulated_angle_weighted_normal;
-
-    float epsilon_min_dist = mesh.average_edge_length * epsilon;
-    float epsilon_min_dist_sq = epsilon_min_dist * epsilon_min_dist;
-
-    while (count) {
-        const int nodeIndex = stack[--count];
-        BVHPackedNodeHalf lower = bvh_load_node(mesh.bvh.node_lowers, nodeIndex);
-        BVHPackedNodeHalf upper = bvh_load_node(mesh.bvh.node_uppers, nodeIndex);
-
-        // re-test distance
-        float node_dist_sq
-            = distance_to_aabb_sq(point, vec3(lower.x, lower.y, lower.z), vec3(upper.x, upper.y, upper.z));
-        if (node_dist_sq > (min_dist + epsilon_min_dist) * (min_dist + epsilon_min_dist)) {
-            continue;
-        }
-
-        const int left_index = lower.i;
-        const int right_index = upper.i;
-
-        if (lower.b) {
-            const int start = left_index;
-            const int end = right_index;
-            // loops through primitives in the leaf
-            for (int primitive_counter = start; primitive_counter < end; primitive_counter++) {
-                int primitive_index = bvh_load_int(mesh.bvh.primitive_indices, primitive_counter);
-                int i = bvh_load_int(mesh.indices, primitive_index * 3 + 0);
-                int j = bvh_load_int(mesh.indices, primitive_index * 3 + 1);
-                int k = bvh_load_int(mesh.indices, primitive_index * 3 + 2);
-
-                vec3 p = mesh.points[i];
-                vec3 q = mesh.points[j];
-                vec3 r = mesh.points[k];
-
-                vec3 e0 = q - p;
-                vec3 e1 = r - p;
-                vec3 e2 = r - q;
-                vec3 normal = cross(e0, e1);
-
-                // sliver detection
-                float e0_norm_sq = dot(e0, e0);
-                float e1_norm_sq = dot(e1, e1);
-                float e2_norm_sq = dot(e2, e2);
-                if (length(normal) / (e0_norm_sq + e1_norm_sq + e2_norm_sq) < 1.e-6f)
-                    continue;
-
-                vec2 barycentric = closest_point_to_triangle(p, q, r, point);
-                float u = barycentric[0];
-                float v = barycentric[1];
-                float w = 1.f - u - v;
-                vec3 c = u * p + v * q + w * r;
-                vec3 delta = mesh_query_triangle_point_delta(p, q, r, point, u, v, w);
-                float dist = sqrtf(length_sq(delta));
-                if (dist < min_dist + epsilon_min_dist) {
-                    float weight = 0.0f;
-                    vec3 cp = c - p;
-                    vec3 cq = c - q;
-                    vec3 cr = c - r;
-                    float len_cp_sq = length_sq(cp);
-                    float len_cq_sq = length_sq(cq);
-                    float len_cr_sq = length_sq(cr);
-
-                    // Check if near vertex
-                    if (len_cp_sq < epsilon_min_dist_sq) {
-                        // Vertex 0 is the closest feature
-                        weight = acosf(dot(normalize(e0), normalize(e1)));
-                    } else if (len_cq_sq < epsilon_min_dist_sq) {
-                        // Vertex 1 is the closest feature
-                        weight = acosf(dot(normalize(e2), normalize(-e0)));
-                    } else if (len_cr_sq < epsilon_min_dist_sq) {
-                        // Vertex 2 is the closest feature
-                        weight = acosf(dot(normalize(-e1), normalize(-e2)));
-                    } else {
-                        float e0cp = dot(e0, cp);
-                        float e2cq = dot(e2, cq);
-                        float e1cp = dot(e1, cp);
-
-                        if ((len_cp_sq * e0_norm_sq - e0cp * e0cp < epsilon_min_dist_sq * e0_norm_sq)
-                            || (len_cq_sq * e2_norm_sq - e2cq * e2cq < epsilon_min_dist_sq * e2_norm_sq)
-                            || (len_cp_sq * e1_norm_sq - e1cp * e1cp < epsilon_min_dist_sq * e1_norm_sq)) {
-                            // One of the edge
-                            weight = 3.14159265359f;  // PI
-                        } else {
-                            weight = 2.0f * 3.14159265359f;  // 2*PI
-                        }
-                    }
-
-                    if (dist > min_dist - epsilon_min_dist) {
-                        // Treat as equal
-                        accumulated_angle_weighted_normal += weight * normalize(normal);
-                        if (dist < min_dist) {
-                            min_dist = dist;
-                            min_v = v;
-                            min_w = w;
-                            min_face = primitive_index;
-                        }
-                    } else {
-                        // Less
-                        min_dist = dist;
-                        min_v = v;
-                        min_w = w;
-                        min_face = primitive_index;
-                        accumulated_angle_weighted_normal = weight * normalize(normal);
-                    }
-                }
-            }
-        } else {
-            BVHPackedNodeHalf left_lower = bvh_load_node(mesh.bvh.node_lowers, left_index);
-            BVHPackedNodeHalf left_upper = bvh_load_node(mesh.bvh.node_uppers, left_index);
-
-            BVHPackedNodeHalf right_lower = bvh_load_node(mesh.bvh.node_lowers, right_index);
-            BVHPackedNodeHalf right_upper = bvh_load_node(mesh.bvh.node_uppers, right_index);
-
-            float left_dist_sq = distance_to_aabb_sq(
-                point, vec3(left_lower.x, left_lower.y, left_lower.z), vec3(left_upper.x, left_upper.y, left_upper.z)
-            );
-            float right_dist_sq = distance_to_aabb_sq(
-                point, vec3(right_lower.x, right_lower.y, right_lower.z),
-                vec3(right_upper.x, right_upper.y, right_upper.z)
-            );
-
-            wp::vec2i child_indices;
-            wp::vec2 child_dist;
-            if (left_dist_sq < right_dist_sq) {
-                child_indices = wp::vec2i(right_index, left_index);
-                child_dist = wp::vec2(right_dist_sq, left_dist_sq);
-            } else {
-                child_indices = wp::vec2i(left_index, right_index);
-                child_dist = wp::vec2(left_dist_sq, right_dist_sq);
-            }
-
-            if (child_dist[0] < (min_dist + epsilon_min_dist) * (min_dist + epsilon_min_dist))
-                stack[count++] = child_indices[0];
-
-            if (child_dist[1] < (min_dist + epsilon_min_dist) * (min_dist + epsilon_min_dist))
-                stack[count++] = child_indices[1];
-        }
-    }
-    // check if we found a point, and write outputs
-    if (min_dist < max_dist) {
-        u = 1.0f - min_v - min_w;
-        v = min_v;
-        face = min_face;
-        // determine inside outside using ray-cast parity check
-        // inside = mesh_query_inside(id, point);
-        int i = mesh.indices[min_face * 3 + 0];
-        int j = mesh.indices[min_face * 3 + 1];
-        int k = mesh.indices[min_face * 3 + 2];
-        vec3 p = mesh.points[i];
-        vec3 q = mesh.points[j];
-        vec3 r = mesh.points[k];
-        vec3 closest_point = p * u + q * v + r * min_w;
-        if (dot(accumulated_angle_weighted_normal, point - closest_point) > 0.0) {
-            inside = 1.0f;
-        } else {
-            inside = -1.0f;
-        }
-        return true;
-    } else {
+    if (max_dist <= 0.0f || !mesh_query_point_no_sign(id, point, max_dist, face, u, v))
         return false;
+
+    Mesh mesh = mesh_get(id);
+    vec3 vertices[3];
+    for (int k = 0; k < 3; ++k)
+        vertices[k] = mesh.points[mesh.indices[3 * face + k]];
+
+    // Classify the selected triangle's feature from the original represented
+    // coordinates, not a rounded absolute barycentric reconstruction. The latter
+    // can put adjacent triangles on opposite sides of a vertex-distance cutoff.
+    const vec3d a(vertices[0]);
+    const vec3d b(vertices[1]);
+    const vec3d c(vertices[2]);
+    const vec3d x(point);
+    const vec3d n = cross(b - a, c - a);
+    const double h0 = dot(cross(b - a, x - a), n);
+    const double h1 = dot(cross(c - b, x - b), n);
+    const double h2 = dot(cross(a - c, x - c), n);
+    if (h0 > 0.0 && h1 > 0.0 && h2 > 0.0) {
+        inside = dot(n, x - a) > 0.0 ? 1.0f : -1.0f;
+        return true;
     }
+
+    double best_sq = 1.7976931348623157e308;
+    vec3 feature0;
+    vec3 feature1;
+    vec3d displacement;
+    bool is_vertex = false;
+    for (int k = 0; k < 3; ++k) {
+        const int next = (k + 1) % 3;
+        const vec3d start(vertices[k]);
+        const vec3d end(vertices[next]);
+        const vec3d edge = end - start;
+        const double edge_sq = dot(edge, edge);
+        if (edge_sq == 0.0)
+            continue;
+        const double t = clamp(dot(x - start, edge) / edge_sq, 0.0, 1.0);
+        const vec3d delta = (x - start) - t * edge;
+        const double distance_sq = dot(delta, delta);
+        if (distance_sq < best_sq) {
+            best_sq = distance_sq;
+            displacement = delta;
+            feature0 = vertices[k];
+            feature1 = vertices[next];
+            is_vertex = t == 0.0 || t == 1.0;
+            if (t == 1.0)
+                feature0 = feature1;
+        }
+    }
+
+    // The exact stored endpoint belongs to every incident triangle's bounds,
+    // including when epsilon is zero. Epsilon only pads this local BVH search;
+    // it must not merge different features or change the selected feature.
+    const vec3 center = feature0;
+    const float padding = max(epsilon, 0.0f) * mesh.average_edge_length;
+    bvh_query_t query = bvh_query_aabb(mesh_get_bvh(id), center - vec3(padding), center + vec3(padding), -1);
+    vec3d accumulated_normal;
+    int candidate;
+    while (bvh_query_next(query, candidate, FLT_MAX)) {
+        vec3 fv[3];
+        int anchor = -1;
+        bool has_other = false;
+        for (int k = 0; k < 3; ++k) {
+            fv[k] = mesh.points[mesh.indices[3 * candidate + k]];
+            if (fv[k] == feature0)
+                anchor = k;
+            if (fv[k] == feature1)
+                has_other = true;
+        }
+        if (anchor < 0 || (!is_vertex && !has_other))
+            continue;
+        const vec3d p(fv[anchor]);
+        const vec3d e0 = vec3d(fv[(anchor + 1) % 3]) - p;
+        const vec3d e1 = vec3d(fv[(anchor + 2) % 3]) - p;
+        const vec3d cross_edges = cross(e0, e1);
+        const double area = length(cross_edges);
+        if (area == 0.0)
+            continue;
+        const double weight = is_vertex ? atan2(area, dot(e0, e1)) : 1.0;
+        accumulated_normal += (weight / area) * cross_edges;
+    }
+    inside = dot(accumulated_normal, displacement) > 0.0 ? 1.0f : -1.0f;
+    return true;
 }
 
 CUDA_CALLABLE inline float solid_angle_iterative(uint64_t id, const vec3& p, const float accuracy_sq)

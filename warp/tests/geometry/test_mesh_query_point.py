@@ -1676,6 +1676,245 @@ def test_mesh_query_relative_grad(test, device):
     np.testing.assert_array_equal(radii.grad.numpy(), 0.0)
 
 
+@wp.kernel
+def mesh_query_normal_feature_kernel(
+    mesh: wp.uint64,
+    points: wp.array[wp.vec3],
+    epsilon: float,
+    max_dist: float,
+    results: wp.array2d[float],
+    closest: wp.array[wp.vec3],
+):
+    i = wp.tid()
+    query = wp.mesh_query_point_sign_normal(mesh, points[i], max_dist, epsilon)
+    results[i, 0] = float(query.result)
+    results[i, 1] = query.sign
+    if query.result:
+        closest[i] = wp.mesh_eval_position(mesh, query.face, query.u, query.v)
+        sign = float(0.0)
+        face = int(0)
+        u = float(0.0)
+        v = float(0.0)
+        found = wp.mesh_query_point_sign_normal(mesh, points[i], max_dist, sign, face, u, v, epsilon)
+        wp.expect_eq(found, query.result)
+        wp.expect_eq(sign, query.sign)
+        wp.expect_eq(face, query.face)
+        wp.expect_eq(u, query.u)
+        wp.expect_eq(v, query.v)
+
+
+def mesh_query_normal_feature_results(
+    vertices, faces, points, device, epsilon=1.0e-3, max_dist=1.0e6, constructor=None, leaf_size=1
+):
+    mesh = wp.Mesh(
+        points=wp.array(vertices, dtype=wp.vec3, device=device),
+        indices=wp.array(faces.ravel(), dtype=int, device=device),
+        bvh_constructor=constructor,
+        bvh_leaf_size=leaf_size,
+    )
+    results = wp.zeros((len(points), 2), dtype=float, device=device)
+    closest = wp.zeros(len(points), dtype=wp.vec3, device=device)
+    wp.launch(
+        mesh_query_normal_feature_kernel,
+        dim=len(points),
+        inputs=[mesh.id, wp.array(points, dtype=wp.vec3, device=device), epsilon, max_dist],
+        outputs=[results, closest],
+        device=device,
+    )
+    return results.numpy(), closest.numpy()
+
+
+def test_mesh_query_normal_distinct_features(test, device):
+    # GH-1836: the closest point lies on the y-z edge. Another triangle has a
+    # different, slightly farther projection within the distance tolerance;
+    # adding its normal can incorrectly classify the exterior point as inside.
+    vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], np.float32)
+    faces = np.array([[0, 2, 1], [0, 3, 2], [0, 1, 3], [1, 2, 3]], np.int32)
+    points = np.array(
+        [
+            [1.15, 1.2, 2.1],
+            [2.1, 1.15, 1.2],
+            [1.2, 2.1, 1.15],
+            [0.1, 0.1, 0.1],
+            [0.2, 0.3, -0.1],
+            [-0.2, -0.3, 0.4],
+            [-0.2, -0.3, -0.4],
+        ],
+        np.float32,
+    )
+    expected_signs = [1, 1, 1, -1, 1, 1, 1]
+    frames = ((0.001, [0, 0, 0]), (1.0, [0, 0, 0]), (1.0, [0.125, -0.25, 0.5]), (1000.0, [0, 0, 0]))
+    for (scale, translation), reverse, shift in itertools.product(frames, (False, True), range(3)):
+        with test.subTest(scale=scale, translation=translation, reverse=reverse, shift=shift):
+            v = (vertices.astype(np.float64) * scale + translation).astype(np.float32)
+            p = (points.astype(np.float64) * scale + translation).astype(np.float32)
+            f = np.roll(faces[::-1] if reverse else faces, shift, axis=1).copy()
+            result, closest = mesh_query_normal_feature_results(v, f, p, device)
+            np.testing.assert_array_equal(result[:, 0], 1)
+            np.testing.assert_array_equal(result[:, 1], expected_signs)
+            expected_distance = np.array(
+                [
+                    min(np.linalg.norm(closest_point_triangle_reference(v[face], point) - point) for face in f)
+                    for point in p
+                ]
+            )
+            np.testing.assert_allclose(
+                np.linalg.norm(closest.astype(np.float64) - p, axis=1),
+                expected_distance,
+                rtol=1e-6,
+                atol=1e-7 * scale,
+            )
+
+
+def test_mesh_query_normal_corner_threshold(test, device):
+    # A closed, consistently oriented eight-vertex reduction of a robotics
+    # mesh. Two faces project to the same edge but reconstruct the point a few
+    # nanometres apart. Independent feature classifications straddled a vertex
+    # tolerance, mixing a vertex-angle weight with an edge's pi weight.
+    vertices = np.array(
+        [
+            [-0.019435452297329903, 0.00413117278367281, 0.08126513659954071],
+            [-0.01957828924059868, 0.004209824372082949, 0.08056332170963287],
+            [-0.019403696060180664, 0.00411322433501482, 0.08142529428005219],
+            [-0.010860700160264969, 0.0033294837921857834, 0.08107469230890274],
+            [-0.010516689158976078, 0.00411322433501482, 0.08142529428005219],
+            [-0.010278727859258652, 0.004152516834437847, 0.08107469230890274],
+            [-0.010756361298263073, 0.0042252917774021626, 0.08042529970407486],
+            [-0.015278727747499943, 0.001152516808360815, 0.08107469230890274],
+        ],
+        np.float32,
+    )
+    faces = np.array(
+        [
+            [0, 2, 5],
+            [0, 5, 1],
+            [2, 4, 5],
+            [1, 5, 6],
+            [3, 6, 5],
+            [3, 5, 4],
+            [2, 0, 7],
+            [0, 1, 7],
+            [4, 2, 7],
+            [1, 6, 7],
+            [6, 3, 7],
+            [3, 4, 7],
+        ],
+        np.int32,
+    )
+    outside = np.array([-0.010089532472193241, 0.010998648591339588, 0.08197584003210068], np.float32)
+    test.assertGreater(outside[1], vertices[:, 1].max())
+    points = np.array([outside, 0.5 * (vertices[5] + vertices[7])], np.float32)
+    # Preserve the original physical feature tolerance after reducing the mesh.
+    # Include controls on either side and retain the public default as well.
+    for epsilon, reverse, shift in itertools.product((0.0009, 0.0009912201, 0.001), (False, True), range(3)):
+        with test.subTest(epsilon=epsilon, reverse=reverse, shift=shift):
+            f = np.roll(faces[::-1] if reverse else faces, shift, axis=1).copy()
+            result, _ = mesh_query_normal_feature_results(vertices, f, points, device, epsilon)
+            np.testing.assert_array_equal(result[:, 0], 1)
+            np.testing.assert_array_equal(result[:, 1], [1, -1])
+
+
+def test_mesh_query_normal_open_surface(test, device):
+    # NORMAL is also useful as a local oriented-side query on an open surface.
+    # It must retain that behavior, rather than falling back to solid parity.
+    vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], np.float32)
+    points = np.array(
+        [[0.2, 0.3, 0.1], [0.2, 0.3, -0.1], [0.6, 0.6, 0.1], [0.6, 0.6, -0.1], [-0.2, -0.3, 0.1], [-0.2, -0.3, -0.1]],
+        np.float32,
+    )
+    for reversed_winding, shift in itertools.product((False, True), range(3)):
+        with test.subTest(reversed_winding=reversed_winding, shift=shift):
+            face = np.array([[0, 2, 1] if reversed_winding else [0, 1, 2]], np.int32)
+            face = np.roll(face, shift, axis=1).copy()
+            result, _ = mesh_query_normal_feature_results(vertices, face, points, device)
+            np.testing.assert_array_equal(result[:, 0], 1)
+            expected = np.array([1, -1, 1, -1, 1, -1]) * (-1 if reversed_winding else 1)
+            np.testing.assert_array_equal(result[:, 1], expected)
+
+
+def mesh_query_normal_cube_fixture():
+    vertices = np.array(
+        [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0], [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]], np.float32
+    )
+    faces = np.array(
+        [
+            [0, 2, 1],
+            [0, 3, 2],
+            [4, 5, 6],
+            [4, 6, 7],
+            [0, 1, 5],
+            [0, 5, 4],
+            [1, 2, 6],
+            [1, 6, 5],
+            [2, 3, 7],
+            [2, 7, 6],
+            [3, 0, 4],
+            [3, 4, 7],
+        ],
+        np.int32,
+    )
+    return vertices, faces
+
+
+def test_mesh_query_normal_near_corner(test, device):
+    vertices, faces = mesh_query_normal_cube_fixture()
+    # The first projections are strictly in face interiors, although all are
+    # near the same corner. Snapping to that corner can reverse sign. Exact
+    # edge and vertex projections also exercise incident normals across seams.
+    points = np.array(
+        [
+            [-1e-5, 1e-4, 2e-4],
+            [2e-4, -1e-5, 1e-4],
+            [1e-4, 2e-4, -1e-5],
+            [1e-5, 1e-4, 2e-4],
+            [-0.1, -0.2, 0.4],
+            [-0.1, -0.2, -0.3],
+        ],
+        np.float32,
+    )
+    constructors = ["sah", "median"]
+    if device.is_cuda:
+        constructors.append("lbvh")
+    if wp.is_cubql_available():
+        constructors.append("cubql")
+    for epsilon, expanded, scale, constructor in itertools.product(
+        (0.0, 0.001, 0.05), (False, True), (0.001, 1.0), constructors
+    ):
+        with test.subTest(epsilon=epsilon, expanded=expanded, scale=scale, constructor=constructor):
+            v, f = vertices * scale, faces
+            if expanded:
+                # Coordinate-coincident seams must not change the oriented
+                # surface when each triangle has its own vertex indices.
+                v = v[f].reshape(-1, 3)
+                f = np.arange(len(v), dtype=np.int32).reshape(-1, 3)
+            result, _ = mesh_query_normal_feature_results(
+                v, f, points * scale, device, epsilon, constructor=constructor, leaf_size=4
+            )
+            np.testing.assert_array_equal(result[:, 0], 1)
+            np.testing.assert_array_equal(result[:, 1], [1, 1, 1, -1, 1, 1])
+
+
+def test_mesh_query_normal_disconnected_surfaces(test, device):
+    vertices, faces = mesh_query_normal_cube_fixture()
+    vertices = np.vstack((vertices, vertices + np.array([0, 0, 1.0001], np.float32)))
+    faces = np.vstack((faces, faces + 8))
+    # Opposing surfaces belong to different closed components. They are close
+    # in distance, but do not share the closest feature or its pseudonormal.
+    points = np.array(
+        [[0.25, 0.25, 1.000025], [0.25, 0.25, 1.000075], [0.25, 0.25, 0.999975], [0.25, 0.25, 1.000125]], np.float32
+    )
+    for epsilon, reverse in itertools.product((0.0, 0.001, 0.05), (False, True)):
+        with test.subTest(epsilon=epsilon, reverse=reverse):
+            f = faces[::-1].copy() if reverse else faces
+            result, _ = mesh_query_normal_feature_results(vertices, f, points, device, epsilon)
+            np.testing.assert_array_equal(result[:, 0], 1)
+            np.testing.assert_array_equal(result[:, 1], [1, 1, -1, -1])
+    # No face lies within this radius; extra normal-accumulation passes must
+    # preserve the ordinary miss result.
+    result, _ = mesh_query_normal_feature_results(vertices, faces, [[0.25, 0.25, -0.125]], device, max_dist=0.0625)
+    np.testing.assert_array_equal(result[:, 0], 0)
+
+
 devices = get_test_devices()
 
 
@@ -1751,6 +1990,30 @@ add_function_test(
 )
 add_function_test(TestMeshQueryPoint, "test_mesh_query_relative_tie", test_mesh_query_relative_tie, devices=devices)
 add_function_test(TestMeshQueryPoint, "test_mesh_query_relative_grad", test_mesh_query_relative_grad, devices=devices)
+add_function_test(
+    TestMeshQueryPoint,
+    "test_mesh_query_normal_distinct_features",
+    test_mesh_query_normal_distinct_features,
+    devices=devices,
+)
+add_function_test(
+    TestMeshQueryPoint,
+    "test_mesh_query_normal_corner_threshold",
+    test_mesh_query_normal_corner_threshold,
+    devices=devices,
+)
+add_function_test(
+    TestMeshQueryPoint, "test_mesh_query_normal_open_surface", test_mesh_query_normal_open_surface, devices=devices
+)
+add_function_test(
+    TestMeshQueryPoint, "test_mesh_query_normal_near_corner", test_mesh_query_normal_near_corner, devices=devices
+)
+add_function_test(
+    TestMeshQueryPoint,
+    "test_mesh_query_normal_disconnected_surfaces",
+    test_mesh_query_normal_disconnected_surfaces,
+    devices=devices,
+)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
