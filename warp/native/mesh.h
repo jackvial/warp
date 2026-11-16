@@ -621,24 +621,20 @@ mesh_query_furthest_point_no_sign(uint64_t id, const vec3& point, float min_dist
     }
 }
 
-// A conservative float lower bound. Uncertain arithmetic yields zero, so it
-// cannot prune a potentially closer feature. Nonzero differences must be large
-// enough to square normally; the reduction covers subtraction, squares and sum.
+// A conservative float lower bound. The relative reduction covers ordinary
+// subtraction, squares and sum. Components below sqrt(FLT_MIN) contribute less
+// than 4*FLT_MIN together after rounding; the absolute floor covers these and
+// final arithmetic. For larger components, source/subtraction flush errors are
+// negligible compared with the relative allowance. Nonfinite results cannot prune.
 CUDA_CALLABLE inline float mesh_query_normal_aabb_distance_sq(const vec3& point, const vec3& lower, const vec3& upper)
 {
     const float dx = min(upper[0], max(lower[0], point[0])) - point[0];
     const float dy = min(upper[1], max(lower[1], point[1])) - point[1];
     const float dz = min(upper[2], max(lower[2], point[2])) - point[2];
-    // sqrt(FLT_MIN), exactly represented. A flushed zero only omits a
-    // nonnegative contribution; a nonzero tiny difference falls back instead.
-    const float min_difference = 1.0842021724855044e-19f;
-    if ((dx != 0.0f && fabs(dx) < min_difference) || (dy != 0.0f && fabs(dy) < min_difference)
-        || (dz != 0.0f && fabs(dz) < min_difference))
-        return 0.0f;
     const float distance_sq = dx * dx + dy * dy + dz * dz;
     if (!isfinite(distance_sq))
         return 0.0f;
-    return distance_sq * (1.0f - 8.0f * FLT_EPSILON);
+    return max(0.0f, distance_sq * (1.0f - 8.0f * FLT_EPSILON) - 8.0f * FLT_MIN);
 }
 
 CUDA_CALLABLE inline float
@@ -656,28 +652,15 @@ CUDA_CALLABLE inline float mesh_query_normal_radius_upper(double radius_sq)
     return radius * (1.0f + 2.0f * FLT_EPSILON);
 }
 
-CUDA_CALLABLE inline bool mesh_query_normal_same_coordinate(float a, float b)
-{
-    unsigned int a_bits;
-    unsigned int b_bits;
-    memcpy(&a_bits, &a, sizeof(a_bits));
-    memcpy(&b_bits, &b, sizeof(b_bits));
-    return a_bits == b_bits || ((a_bits | b_bits) & 0x7fffffffu) == 0;
-}
-
 // Lower bound for d dot (vertex - point), with d already interpreted as an
 // exact represented direction. The relative allowance exceeds the error of
 // subtraction, three products and two sums, including computing their absolute
-// sum. The absolute term covers flushed source operands/products for |d_i|<=2.
+// sum. For |d_i|<=2, source/subtraction flushes contribute at most 18*FLT_MIN,
+// and the three products and two sums contribute another 5*FLT_MIN. The
+// 32*FLT_MIN allowance also covers rounding slack in those absolute bounds.
 CUDA_CALLABLE inline float mesh_query_normal_support_lower(const vec3& vertex, const vec3& point, const vec3& direction)
 {
     const vec3 delta = vertex - point;
-    for (int k = 0; k < 3; ++k) {
-        if (!isfinite(delta[k]))
-            return 0.0f;
-        if (fabs(delta[k]) < FLT_MIN && !mesh_query_normal_same_coordinate(vertex[k], point[k]))
-            return 0.0f;
-    }
     const float p0 = direction[0] * delta[0];
     const float p1 = direction[1] * delta[1];
     const float p2 = direction[2] * delta[2];
