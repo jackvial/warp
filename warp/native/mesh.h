@@ -733,9 +733,10 @@ CUDA_CALLABLE inline bool mesh_query_normal_triangle_farther(
 // Return a finite triangle's squared distance and nonnegative barycentric
 // weights without first rounding the projected point or weights to float.
 CUDA_CALLABLE inline double mesh_query_normal_triangle_distance_sq(
-    const vec3d& a, const vec3d& b, const vec3d& c, const vec3d& point, vec3d& barycentric
+    const vec3d& a, const vec3d& b, const vec3d& c, const vec3d& point, vec3d& barycentric, float& interior_sign
 )
 {
+    interior_sign = 0.0f;
     const vec3d n = cross(b - a, c - a);
     const double n_sq = dot(n, n);
     const double h0 = dot(cross(b - a, point - a), n);
@@ -744,6 +745,10 @@ CUDA_CALLABLE inline double mesh_query_normal_triangle_distance_sq(
     if (n_sq > 0.0 && h0 >= 0.0 && h1 >= 0.0 && h2 >= 0.0) {
         barycentric = vec3d(h1, h2, h0) / (h0 + h1 + h2);
         const double height = dot(n, point - a);
+        // Reuse the strict-interior classification already needed for NORMAL.
+        // Zero is a sentinel: edge/vertex queries still use the original fan.
+        if (h0 > 0.0 && h1 > 0.0 && h2 > 0.0)
+            interior_sign = height > 0.0 ? 1.0f : -1.0f;
         return height * height / n_sq;
     }
 
@@ -768,12 +773,37 @@ CUDA_CALLABLE inline double mesh_query_normal_triangle_distance_sq(
     return best_sq;
 }
 
+CUDA_CALLABLE inline double mesh_query_normal_triangle_radius_sq(
+    const vec3d& a, const vec3d& b, const vec3d& c, const vec3d& point, const vec3d& barycentric, double distance_sq
+)
+{
+    // A normalized nonnegative weighted point belongs to the triangle even if
+    // its projection weights have rounding error. Its distance therefore gives
+    // an upper bound independently of the face-distance calculation.
+    const vec3d da = a - point;
+    const vec3d db = b - point;
+    const vec3d dc = c - point;
+    const double weight_sum = barycentric[0] + barycentric[1] + barycentric[2];
+    const vec3d delta = (barycentric[0] * da + barycentric[1] * db + barycentric[2] * dc) / weight_sum;
+    // Cover the rounded weighted sum, normalization and norm. Only traversal
+    // is expanded; acceptance remains strictly inside the unpadded max_dist.
+    const double input_l1 = fabs(da[0]) + fabs(da[1]) + fabs(da[2]) + fabs(db[0]) + fabs(db[1]) + fabs(db[2])
+        + fabs(dc[0]) + fabs(dc[1]) + fabs(dc[2]);
+    const double delta_l1 = fabs(delta[0]) + fabs(delta[1]) + fabs(delta[2]);
+    const double roundoff = 32.0 * DBL_EPSILON * input_l1;
+    // ||delta||_1 >= ||delta||_2 bounds the cross term without square roots.
+    return max(
+        distance_sq, (dot(delta, delta) + 2.0 * roundoff * delta_l1 + roundoff * roundoff) * (1.0 + 8.0 * DBL_EPSILON)
+    );
+}
+
 // NORMAL needs the actual nearest eligible feature, not one selected by a
 // float squared-distance tie: an adjacent face can have the opposite sign.
 // Keep this higher-precision search private to NORMAL; unsigned and parity
 // queries retain their existing paths.
-CUDA_CALLABLE inline bool
-mesh_query_point_normal_closest(uint64_t id, const vec3& point, float max_dist, int& face, float& u, float& v)
+CUDA_CALLABLE inline bool mesh_query_point_normal_closest(
+    uint64_t id, const vec3& point, float max_dist, int& face, float& u, float& v, float& interior_sign
+)
 {
     if (!(max_dist > 0.0f))
         return false;
@@ -786,6 +816,43 @@ mesh_query_point_normal_closest(uint64_t id, const vec3& point, float max_dist, 
     float search_radius_upper_sq = mesh_query_normal_radius_upper(search_radius_sq);
     int min_face = -1;
     vec3d min_barycentric;
+    float min_interior_sign = 0.0f;
+
+    // Use the inexpensive query only to propose an incumbent. Neither a hit
+    // nor a miss certifies nearestness: recompute its eligible triangle in DP,
+    // then always run the conservative traversal below for all competitors.
+    int seed_face = -1;
+    int proposed_face;
+    float proposed_u;
+    float proposed_v;
+    if (mesh_query_point_no_sign(id, point, max_dist, proposed_face, proposed_u, proposed_v)) {
+        const vec3 p = mesh.points[bvh_load_int(mesh.indices, proposed_face * 3)];
+        const vec3 q = mesh.points[bvh_load_int(mesh.indices, proposed_face * 3 + 1)];
+        const vec3 r = mesh.points[bvh_load_int(mesh.indices, proposed_face * 3 + 2)];
+        const vec3 e0 = q - p;
+        const vec3 e1 = r - p;
+        const vec3 e2 = r - q;
+        if (!(length(cross(e0, e1)) / (dot(e0, e0) + dot(e1, e1) + dot(e2, e2)) < 1.e-6f)) {
+            const vec3d a(p);
+            const vec3d b(q);
+            const vec3d c(r);
+            vec3d barycentric;
+            float seed_interior_sign;
+            const double distance_sq
+                = mesh_query_normal_triangle_distance_sq(a, b, c, x, barycentric, seed_interior_sign);
+            seed_face = proposed_face;
+            if (distance_sq < min_dist_sq && distance_sq < DBL_MAX) {
+                min_dist_sq = distance_sq;
+                min_face = seed_face;
+                min_barycentric = barycentric;
+                min_interior_sign = seed_interior_sign;
+                search_radius_sq
+                    = min(search_radius_sq, mesh_query_normal_triangle_radius_sq(a, b, c, x, barycentric, distance_sq));
+                search_radius_upper_sq = mesh_query_normal_radius_upper(search_radius_sq);
+            }
+        }
+    }
+
     int stack[BVH_QUERY_STACK_SIZE];
     stack[0] = *mesh.bvh.root;
     int count = 1;
@@ -799,6 +866,9 @@ mesh_query_point_normal_closest(uint64_t id, const vec3& point, float max_dist, 
         if (lower.b) {
             for (int primitive_counter = lower.i; primitive_counter < upper.i; ++primitive_counter) {
                 const int candidate = bvh_load_int(mesh.bvh.primitive_indices, primitive_counter);
+                // Only this identical face has already been evaluated in DP.
+                if (candidate == seed_face)
+                    continue;
                 const vec3 p = mesh.points[bvh_load_int(mesh.indices, candidate * 3)];
                 const vec3 q = mesh.points[bvh_load_int(mesh.indices, candidate * 3 + 1)];
                 const vec3 r = mesh.points[bvh_load_int(mesh.indices, candidate * 3 + 2)];
@@ -825,36 +895,17 @@ mesh_query_point_normal_closest(uint64_t id, const vec3& point, float max_dist, 
                 const vec3d b(q);
                 const vec3d c(r);
                 vec3d barycentric;
-                const double distance_sq = mesh_query_normal_triangle_distance_sq(a, b, c, x, barycentric);
+                float candidate_interior_sign;
+                const double distance_sq
+                    = mesh_query_normal_triangle_distance_sq(a, b, c, x, barycentric, candidate_interior_sign);
                 if (distance_sq < min_dist_sq && distance_sq < DBL_MAX) {
                     min_dist_sq = distance_sq;
                     min_face = candidate;
                     min_barycentric = barycentric;
-
-                    // A normalized nonnegative weighted point belongs to the
-                    // triangle even if its projection weights have rounding
-                    // error. Its distance therefore gives an upper bound for
-                    // pruning, independently of the face-distance calculation.
-                    const vec3d da = a - x;
-                    const vec3d db = b - x;
-                    const vec3d dc = c - x;
-                    const double weight_sum = barycentric[0] + barycentric[1] + barycentric[2];
-                    const vec3d delta = (barycentric[0] * da + barycentric[1] * db + barycentric[2] * dc) / weight_sum;
-                    // Cover the rounded weighted sum, normalization and norm.
-                    // Only traversal is expanded; acceptance stays strictly
-                    // inside max_dist, without any spatial tolerance.
-                    const double input_l1 = fabs(da[0]) + fabs(da[1]) + fabs(da[2]) + fabs(db[0]) + fabs(db[1])
-                        + fabs(db[2]) + fabs(dc[0]) + fabs(dc[1]) + fabs(dc[2]);
-                    const double delta_l1 = fabs(delta[0]) + fabs(delta[1]) + fabs(delta[2]);
-                    const double roundoff = 32.0 * DBL_EPSILON * input_l1;
-                    // ||delta||_1 >= ||delta||_2 bounds the cross term without
-                    // the four double square roots used by a norm-radius sum.
-                    const double radius_sq = max(
-                        distance_sq,
-                        (dot(delta, delta) + 2.0 * roundoff * delta_l1 + roundoff * roundoff)
-                            * (1.0 + 8.0 * DBL_EPSILON)
+                    min_interior_sign = candidate_interior_sign;
+                    search_radius_sq = min(
+                        search_radius_sq, mesh_query_normal_triangle_radius_sq(a, b, c, x, barycentric, distance_sq)
                     );
-                    search_radius_sq = min(search_radius_sq, radius_sq);
                     search_radius_upper_sq = mesh_query_normal_radius_upper(search_radius_sq);
                 }
             }
@@ -886,6 +937,7 @@ mesh_query_point_normal_closest(uint64_t id, const vec3& point, float max_dist, 
     u = 1.0f - min_v - min_w;
     v = min_v;
     face = min_face;
+    interior_sign = min_interior_sign;
     return true;
 }
 
@@ -904,29 +956,20 @@ CUDA_CALLABLE inline bool mesh_query_point_sign_normal(
     const float epsilon = 1e-3f
 )
 {
-    if (!mesh_query_point_normal_closest(id, point, max_dist, face, u, v))
+    float interior_sign;
+    if (!mesh_query_point_normal_closest(id, point, max_dist, face, u, v, interior_sign))
         return false;
+    if (interior_sign != 0.0f) {
+        inside = interior_sign;
+        return true;
+    }
 
     Mesh mesh = mesh_get(id);
     vec3 vertices[3];
     for (int k = 0; k < 3; ++k)
         vertices[k] = mesh.points[mesh.indices[3 * face + k]];
 
-    // Classify the selected triangle's feature from the original represented
-    // coordinates, not a rounded absolute barycentric reconstruction. The latter
-    // can put adjacent triangles on opposite sides of a vertex-distance cutoff.
-    const vec3d a(vertices[0]);
-    const vec3d b(vertices[1]);
-    const vec3d c(vertices[2]);
     const vec3d x(point);
-    const vec3d n = cross(b - a, c - a);
-    const double h0 = dot(cross(b - a, x - a), n);
-    const double h1 = dot(cross(c - b, x - b), n);
-    const double h2 = dot(cross(a - c, x - c), n);
-    if (h0 > 0.0 && h1 > 0.0 && h2 > 0.0) {
-        inside = dot(n, x - a) > 0.0 ? 1.0f : -1.0f;
-        return true;
-    }
 
     double best_sq = 1.7976931348623157e308;
     vec3 feature0;
