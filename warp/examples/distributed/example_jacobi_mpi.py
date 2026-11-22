@@ -345,16 +345,16 @@ class Example:
     def apply_periodic_bc(self) -> None:
         """Apply periodic boundary conditions to the array.
 
-        This function sends the first row of owned data to the lower neighbor
-        and the last row of owned data to the upper neighbor.
+        Send the first owned row to the upper neighbor and the last owned row
+        to the lower neighbor.
         """
-        # Send the first row of owned data to the lower neighbor
+        # Fill the bottom halo with the lower neighbor's first owned row.
         self.mpi_comm.Sendrecv(
-            self.a_new[self.iy_start], self.lower_neighbor, 0, self.a_new[self.iy_end], self.upper_neighbor, 0
+            self.a_new[self.iy_start], self.upper_neighbor, 0, self.a_new[self.iy_end], self.lower_neighbor, 0
         )
-        # Send the last row of owned data to the upper neighbor
+        # Fill the top halo with the upper neighbor's last owned row.
         self.mpi_comm.Sendrecv(
-            self.a_new[self.iy_end - 1], self.upper_neighbor, 0, self.a_new[0], self.lower_neighbor, 0
+            self.a_new[self.iy_end - 1], self.lower_neighbor, 0, self.a_new[0], self.upper_neighbor, 0
         )
 
     def step(self, calculate_norm: bool) -> None:

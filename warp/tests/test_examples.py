@@ -23,8 +23,10 @@ Use the "num_frames" and "train_iters" keys to control the number of steps.
 Use "test_timeout" to override the default test timeout threshold of 600 seconds.
 """
 
+import importlib.util
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -191,7 +193,19 @@ test_devices = get_test_devices(mode="basic")
 
 
 class TestCoreExamples(unittest.TestCase):
-    pass
+    def test_jacobi_mpi_halos(self):
+        mpiexec = shutil.which("mpiexec")
+        if mpiexec is None or importlib.util.find_spec("mpi4py") is None:
+            self.skipTest("Requires mpiexec and mpi4py")
+
+        result = subprocess.run(
+            [mpiexec, "-n", "3", sys.executable, "-m", "warp.tests.aux_test_jacobi_mpi"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
 
 
 # Exclude unless we can run headless somehow
